@@ -1,0 +1,29 @@
+# Test binary, built with `go test -c`
+*.test
+
+# Editor/IDE
+.vscode/
+.claude
+
+# macOS
+**/.DS_Store
+**/~*
+
+# transient work dirs
+_bin/
+_dev/
+sandbox/
+install/
+testdata/
+
+# working plans stay local; the rest of docs/ is committed
+docs/plan/
+
+# binaries built at repo root
+/mcp
+/mcpd
+
+# build/ tracks only the build script (build/mcp); its output is not tracked
+build/install/
+build/bin/
+build/host
