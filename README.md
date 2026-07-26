@@ -251,3 +251,7 @@ method names, batch member caps, subscription quotas, idle and handshake
 timeouts, per-uid connection limits, symlinked socket paths, socket permission
 width, header floods, read-buffer aliasing, list cache invalidation, and
 large-integer id collisions.
+
+## License
+
+Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).
