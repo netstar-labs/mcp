@@ -1,9 +1,11 @@
 # mcp — architecture
 
 A flat library at the repo root (`package mcp`), one concern per file, with the
-reference daemon under `app/mcpd`. The README is the full reference (security,
-performance, protocol coverage, the bugs the hardening found); this is the guided
-tour of the subsystems and the data flow.
+reference daemon under `app/mcpd`. It now implements **both roles** — the server
+(most of the files below) and a matching `Client` (`client.go`) that consumes an MCP
+server over the same wire. The README is the full reference (security, performance,
+protocol coverage, the bugs the hardening found); this is the guided tour of the
+subsystems and the data flow.
 
 ## Data flow
 
@@ -41,6 +43,14 @@ registry (tools / resources / prompts)  ──▶ handler ──▶ result ─�
   handlers and flush queued replies before teardown).
 - **`dispatch.go`** — method handlers and URI-template matching (`Matches` answers
   yes/no without building the variable map).
+- **`client.go`** — the other role on the same wire. `Dial` opens a `Client` over
+  any `io.ReadWriteCloser` (Unix socket, stdio pipe pair, in-memory pipe); a
+  background read loop correlates responses by JSON-RPC id, serialises writes, and
+  dispatches server→client requests (`elicitation/create`) to an `OnRequest`
+  handler. `Initialize` / `ListTools` / `CallTool` / `Close`. Reuses `framing.go`,
+  `jsonrpc.go`, and `protocol.go` unchanged — one wire, two roles — and is
+  deliberately minimal (no resources/prompts/sampling, no pagination past the first
+  page).
 - **`transport.go`** — `ServeStdio`, `ListenUnix` (umask creation, stale reclaim,
   symlink refusal, mode/owner verification), `ListenSystemd`, the accept loop with
   admission, and the connection gate (total + per-UID caps).
@@ -67,3 +77,8 @@ registry (tools / resources / prompts)  ──▶ handler ──▶ result ─�
   permissions carry the access control.
 - **stdio owns stdout** — nothing else in the process may write there; the logger
   defaults to stderr.
+- **HTTP is scoped, not built** — server and client both speak stdio + Unix-socket
+  framing today. The streamable-HTTP transport is designed (a per-session
+  `httpFramer` presenting a `Framer` to the existing Session, unchanged —
+  [plan/scope-http-transport.md](plan/scope-http-transport.md)) but not yet
+  implemented; the `Framer` interface is the seam it plugs into.

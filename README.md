@@ -1,7 +1,9 @@
-# mcp — an MCP server in Go, standard library only
+# mcp — an MCP server and client in Go, standard library only
 
 No third-party dependencies, no code generation, no reflection tricks. `go.mod`
-has no require block and it stays that way.
+has no require block and it stays that way. The package **serves** MCP (stdio,
+unix socket) and **consumes** it (the `Client`), sharing one `Framer` / JSON-RPC /
+protocol core across both roles — which is what lets one service front another.
 
 ```
 mcp/
@@ -12,10 +14,12 @@ mcp/
   session.go        per-connection state machine, read/write loops, outbound calls
   dispatch.go       method handlers, URI template matching
   transport.go      stdio, Unix sockets, systemd activation, accept loop
+  client.go         MCP client: Dial, Initialize, ListTools, CallTool, server→client dispatch
   peercred_linux.go SO_PEERCRED
   peercred_other.go fallback
   umask_unix.go     socket creation under a umask
   server_test.go    protocol conformance tests over a real socket
+  client_test.go    client↔server round trip over an in-memory pipe
   harden_test.go    limits, quotas, deadlines, injection, cache invalidation
   audit_fixes_test.go regressions: cursor-cache bound, large-id keys, dup Content-Length
   protocol_content_test.go  Content constructors, SessionFromContext
@@ -24,7 +28,7 @@ mcp/
   bench_test.go     benchmarks
 app/mcpd/           reference daemon (the mcpd binary)
 example/stdio/      minimal runnable server (one echo tool over stdio)
-docs/               introduction · executive-summary · architecture · userguide
+docs/               introduction · executive-summary · architecture · userguide · plan/
 build/mcp           cross-compile + package + install the daemon
 ```
 
@@ -81,6 +85,27 @@ something in the path mangles line boundaries.
 
 **systemd** — `ListenSystemd()` adopts `LISTEN_FDS` descriptors, so the daemon
 can be socket-activated and run unprivileged.
+
+## Client
+
+The package consumes MCP as well as serving it — a consumer (a gateway fanning
+out to a local tool server, a tool composing another) drives an upstream over the
+same framing:
+
+```go
+c := mcp.Dial(conn, mcp.ClientOptions{Info: mcp.Implementation{Name: "mcpgw", Version: "0.1.0"}})
+defer c.Close()
+if _, err := c.Initialize(ctx); err != nil { /* … */ }
+tools, _ := c.ListTools(ctx)
+res, _ := c.CallTool(ctx, "resolve", map[string]any{"name": "example.com"})
+```
+
+`Dial` runs a background read loop that correlates responses by id and dispatches
+server→client requests (`elicitation/create`, …) to `ClientOptions.OnRequest`. It
+is deliberately minimal — initialize, list, call, and server-request dispatch —
+enough to drive a local tool server, not a feature-complete client. Client and
+Server share one `Framer` / JSON-RPC / protocol core, so they are wire-compatible
+by construction.
 
 ## Security notes
 
@@ -213,8 +238,10 @@ silently loses its answers.
 ## What is deliberately not here
 
 - **HTTP/SSE transport.** Streamable HTTP needs session resumption, origin
-  validation, and an auth story; that is a separate piece of work, and the
-  `Framer` interface is where it plugs in.
+  validation, and an auth story; that is a separate piece of work — now **scoped**
+  in [docs/plan/scope-http-transport.md](docs/plan/scope-http-transport.md), not
+  yet built (the `Framer` interface is where it plugs in). Both the server and the
+  `Client` currently speak stdio + unix-socket framing.
 - **JSON Schema validation of tool arguments.** Schemas are published to the
   client; validating them server-side means a schema validator, and there
   isn't one in the standard library. Handlers unmarshal into a typed struct and
@@ -232,7 +259,7 @@ go test -run=XXX -bench=. ./...
 (Build/test standalone with `GOWORK=off`; the module has no third-party
 requires.)
 
-55 tests, no skips on Linux. The hardening controls were mutation-tested —
+58 tests, no skips on Linux. The hardening controls were mutation-tested —
 neutering `sanitize`, the batch cap, cache invalidation and the integer id path
 each produces a failing test, so none of those tests are vacuous.
 
@@ -245,6 +272,11 @@ reply suppression, resource templates, subscription routing, prompt argument
 validation, a server-initiated `roots/list` round trip, progress tokens, the
 logging severity gate, batching, parse errors, frame size limits, header
 framing, `SO_PEERCRED`, the peer allow-list, and concurrent dispatch.
+
+`client_test.go` drives the `Client` against a real `Server` over an in-memory
+pipe: initialize, list, call, the execution-error vs protocol-error distinction,
+and unknown-tool — client and server from the same package, so the round trip
+proves the two are wire-compatible.
 
 `harden_test.go` covers the limits and quotas: log injection, oversized ids and
 method names, batch member caps, subscription quotas, idle and handshake
