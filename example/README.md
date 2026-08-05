@@ -15,5 +15,9 @@ stdout — the MCP stdio wire format:
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}
 ```
 
+The package is also an MCP **client** (`mcp.Dial` → `Initialize`/`ListTools`/
+`CallTool`) — no standalone client example lives here yet; see the
+[user guide](../docs/userguide.md#client).
+
 For the reference daemon over a Unix socket (with peer-credential admission), see
 [../docs/userguide.md](../docs/userguide.md) and `go run ./app/mcpd -h`.

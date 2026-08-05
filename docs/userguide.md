@@ -34,6 +34,35 @@ helpers `TextContent`/`ImageContent`/`AudioContent`/`ResourceLink`/
 See the runnable [example](../example/README.md) and the README for the full
 protocol surface.
 
+## Client
+
+The same package is also an MCP **client** — enough to drive a tool server (a
+gateway fronting another service, a tool that composes one). It speaks the same
+framing over any byte stream: a Unix socket, a stdio pipe pair, an in-memory
+`net.Pipe`.
+
+```go
+conn, _ := net.Dial("unix", "/run/mcpd/mcpd.sock")
+c := mcp.Dial(conn, mcp.ClientOptions{
+    Info:      mcp.Implementation{Name: "gateway", Version: "1.0.0"},
+    OnRequest: nil, // server→client requests (e.g. elicitation/create) ⇒ method-not-found
+})
+defer c.Close()
+
+if _, err := c.Initialize(ctx); err != nil {           // handshake + notifications/initialized
+    log.Fatal(err)
+}
+tools, _ := c.ListTools(ctx)                            // first page of tools
+res, err := c.CallTool(ctx, "sha256", map[string]any{"input": "hi"})
+// err is a JSON-RPC error (unknown tool, bad arguments);
+// a tool that ran and failed is res with res.IsError set.
+```
+
+`ClientOptions` also carries `Framing` (defaults to the `lines` framer) and
+`MaxMessageBytes`; set `OnRequest` to answer server→client requests. The client is
+deliberately minimal — tools only, first page of results — and reuses the server's
+Framer, JSON-RPC, and protocol types: one wire, two roles.
+
 ## The `mcpd` daemon
 
 Build: `go build -o mcpd ./app/mcpd` (standalone: `GOWORK=off`).
@@ -71,6 +100,9 @@ mcpd -stdio -socket /tmp/mcpd.sock                      # both, one shared regis
   at risk.
 - **systemd** — `ListenSystemd()` adopts `LISTEN_FDS`, so the daemon can be
   socket-activated and run unprivileged.
+- **HTTP** — a streamable-HTTP transport is **scoped**
+  ([design](plan/scope-http-transport.md)) but not yet built; today both server and
+  client speak stdio + Unix-socket framing.
 
 ## Security operations
 
