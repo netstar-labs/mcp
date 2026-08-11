@@ -50,7 +50,9 @@ registry (tools / resources / prompts)  ──▶ handler ──▶ result ─�
   handler. `Initialize` / `ListTools` / `CallTool` / `Close`. Reuses `framing.go`,
   `jsonrpc.go`, and `protocol.go` unchanged — one wire, two roles — and is
   deliberately minimal (no resources/prompts/sampling, no pagination past the first
-  page).
+  page). Its production consumer is
+  [`mcpgw`](https://github.com/netstar-labs/mcpgw), which mounts an upstream tool
+  server's tools as gated proxies over a unix socket or a spawned stdio child.
 - **`transport.go`** — `ServeStdio`, `ListenUnix` (umask creation, stale reclaim,
   symlink refusal, mode/owner verification), `ListenSystemd`, the accept loop with
   admission, and the connection gate (total + per-UID caps).
@@ -79,6 +81,9 @@ registry (tools / resources / prompts)  ──▶ handler ──▶ result ─�
   defaults to stderr.
 - **HTTP is scoped, not built** — server and client both speak stdio + Unix-socket
   framing today. The streamable-HTTP transport is designed (a per-session
-  `httpFramer` presenting a `Framer` to the existing Session, unchanged —
-  [plan/scope-http-transport.md](plan/scope-http-transport.md)) but not yet
-  implemented; the `Framer` interface is the seam it plugs into.
+  `httpFramer` presenting a `Framer` to the existing Session, unchanged — working
+  note in the untracked `docs/plan/scope-http-transport.md`) but not yet
+  implemented; the `Framer` interface is the seam it plugs into. Until it lands,
+  the one consumer that needs to *serve* MCP over HTTP —
+  [`mcpgw`](https://github.com/netstar-labs/mcpgw) — hand-rolls that facade
+  itself; it is the second such consumer that should trigger building this.

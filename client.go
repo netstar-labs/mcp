@@ -47,7 +47,7 @@ type ClientOptions struct {
 	Info            Implementation       // client identity sent at initialize
 	Framing         FramingMode          // defaults to FramingLines (MCP stdio / socket)
 	MaxMessageBytes int                  // zero selects DefaultMaxMessageBytes
-	OnRequest       ServerRequestHandler // handles server→client requests; nil ⇒ method-not-found
+	OnRequest       ServerRequestHandler // handles server→client requests; nil ⇒ method-not-found, and the elicitation capability is not advertised
 }
 
 // Dial starts a client over rwc — a socket, a stdio pipe pair, or an in-memory
@@ -74,9 +74,18 @@ func Dial(rwc io.ReadWriteCloser, opts ClientOptions) *Client {
 // which the spec requires before any other request.
 func (c *Client) Initialize(ctx context.Context) (InitializeResult, error) {
 	var res InitializeResult
+	// Advertise elicitation only when a handler can actually answer it. A server
+	// checks the advertised capability before eliciting (Session.Elicit), so
+	// claiming it with a nil handler makes that check pass and then answers the
+	// elicitation with method-not-found mid-call — the failure surfaces on the
+	// server's side, far from the client that mis-advertised.
+	caps := ClientCapabilities{}
+	if c.onReq != nil {
+		caps.Elicitation = &emptyCap{}
+	}
 	raw, err := c.call(ctx, MethodInitialize, InitializeParams{
 		ProtocolVersion: LatestProtocolVersion,
-		Capabilities:    ClientCapabilities{Elicitation: &emptyCap{}},
+		Capabilities:    caps,
 		ClientInfo:      c.info,
 	})
 	if err != nil {

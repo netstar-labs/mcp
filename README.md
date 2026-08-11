@@ -28,7 +28,7 @@ mcp/
   bench_test.go     benchmarks
 app/mcpd/           reference daemon (the mcpd binary)
 example/stdio/      minimal runnable server (one echo tool over stdio)
-docs/               introduction · executive-summary · architecture · userguide · plan/
+docs/               introduction · executive-summary · architecture · userguide (plan/ untracked)
 build/mcp           cross-compile + package + install the daemon
 ```
 
@@ -37,7 +37,8 @@ build/mcp           cross-compile + package + install the daemon
 - **Start here** — [docs/introduction.md](docs/introduction.md) · [docs/executive-summary.md](docs/executive-summary.md)
 - **Deep dive** — [docs/architecture.md](docs/architecture.md) (this README is the reference; the docs are the guided tour)
 - **Operations** — [docs/userguide.md](docs/userguide.md)
-- **Examples** — [example/README.md](example/README.md)
+- **Examples** — [example/README.md](example/README.md); for the client/gateway
+  pattern in production, [`mcpgw`](https://github.com/netstar-labs/mcpgw)
 
 Module `github.com/netstar-labs/mcp` — the root package `mcp` is the importable
 library; `app/mcpd` is the reference daemon.
@@ -239,9 +240,13 @@ silently loses its answers.
 
 - **HTTP/SSE transport.** Streamable HTTP needs session resumption, origin
   validation, and an auth story; that is a separate piece of work — now **scoped**
-  in [docs/plan/scope-http-transport.md](docs/plan/scope-http-transport.md), not
-  yet built (the `Framer` interface is where it plugs in). Both the server and the
-  `Client` currently speak stdio + unix-socket framing.
+  (working note in the untracked `docs/plan/scope-http-transport.md`), not yet
+  built (the `Framer` interface is where it plugs in). Both the server and the
+  `Client` currently speak stdio + unix-socket framing. The one service that has
+  to serve MCP over the network today,
+  [`mcpgw`](https://github.com/netstar-labs/mcpgw), hand-rolls that facade and
+  keeps its auth/gate/capture policy on its own side — a second such consumer is
+  the trigger to build this properly here.
 - **JSON Schema validation of tool arguments.** Schemas are published to the
   client; validating them server-side means a schema validator, and there
   isn't one in the standard library. Handlers unmarshal into a typed struct and

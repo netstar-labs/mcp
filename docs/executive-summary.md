@@ -37,11 +37,15 @@ embeds an MCP mode; this is the general server other tools/data plug into). An
 agent host connects; the server exposes exactly the registered tools and nothing
 more. With the client in the same package, one netstar service can now front
 another — the gateway pattern: serve on one side, consume on the other, over one
-wire.
+wire. That pattern is shipped, not hypothetical:
+[`mcpgw`](https://github.com/netstar-labs/mcpgw) — the MCP edge — reaches
+`aegis-mcp` and the analyzers through this `Client`, and carries only edge policy
+(auth, gate, capture, quota) of its own.
 
 **What it is not.** Not yet an HTTP transport — the streamable-HTTP transport is now
-**scoped** ([design](plan/scope-http-transport.md); the `Framer` interface is the
-seam) but not built, so server and client both speak stdio + Unix-socket framing
-today. Not a server-side schema validator, not a URI template expander, and the
+**scoped** (design in the untracked `docs/plan/scope-http-transport.md`; the
+`Framer` interface is the seam) but not built, so server and client both speak
+stdio + Unix-socket framing today, and `mcpgw` hand-rolls its own HTTP facade until
+it lands. Not a server-side schema validator, not a URI template expander, and the
 client stops at tools (no resources/prompts/sampling). And not multi-dependency —
 the empty require block is a feature, on both ends.

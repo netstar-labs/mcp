@@ -63,6 +63,11 @@ res, err := c.CallTool(ctx, "sha256", map[string]any{"input": "hi"})
 deliberately minimal — tools only, first page of results — and reuses the server's
 Framer, JSON-RPC, and protocol types: one wire, two roles.
 
+For a worked example of the gateway pattern, see
+[`mcpgw`](https://github.com/netstar-labs/mcpgw): it dials a local tool server with
+this client (unix socket or spawned stdio child), republishes the tools it
+advertises as gated proxies, and keeps auth/capture/quota on its own side.
+
 ## The `mcpd` daemon
 
 Build: `go build -o mcpd ./app/mcpd` (standalone: `GOWORK=off`).
@@ -100,9 +105,11 @@ mcpd -stdio -socket /tmp/mcpd.sock                      # both, one shared regis
   at risk.
 - **systemd** — `ListenSystemd()` adopts `LISTEN_FDS`, so the daemon can be
   socket-activated and run unprivileged.
-- **HTTP** — a streamable-HTTP transport is **scoped**
-  ([design](plan/scope-http-transport.md)) but not yet built; today both server and
-  client speak stdio + Unix-socket framing.
+- **HTTP** — a streamable-HTTP transport is **scoped** (working note in the
+  untracked `docs/plan/scope-http-transport.md`) but not yet built; today both
+  server and client speak stdio + Unix-socket framing. A service that must serve
+  MCP over the network fronts this one instead — see
+  [`mcpgw`](https://github.com/netstar-labs/mcpgw).
 
 ## Security operations
 

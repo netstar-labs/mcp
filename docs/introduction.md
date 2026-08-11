@@ -33,11 +33,21 @@ can't wedge the session. Peer-supplied text is sanitised before it is ever logge
 so a client can't forge an audit line. This is the MCP surface for a
 threat-intelligence stack: an agent reaches the tools, and nothing else.
 
+## Who uses it
+
+The client role has a shipped consumer:
+[`mcpgw`](https://github.com/netstar-labs/mcpgw), the NetSTAR MCP edge. It serves
+agents over HTTP at the network boundary and reaches the local tool servers
+(`aegis-mcp`, the analyzers) through this package's `Client` — so the gateway
+carries edge policy (auth, gate, capture, quota) and none of the protocol. That is
+the gateway pattern the client was added for, and it runs live: the aegis fan-out
+returns real DNS through `mcp.Client`.
+
 ## The scope it keeps
 
 It serves *and* consumes now, but deliberately not everything: the streamable-HTTP
-transport is **scoped** (design captured in
-[plan/scope-http-transport.md](plan/scope-http-transport.md)) but not yet built —
+transport is **scoped** (design in the untracked `docs/plan/scope-http-transport.md`;
+`mcpgw` hand-rolls its own facade until it lands) but not yet built —
 server and client both speak stdio + Unix-socket framing today; no server-side
 JSON-Schema validation (handlers unmarshal into typed structs and return a tool
 error on mismatch); URI templates are *matched*, not expanded; and the client is
