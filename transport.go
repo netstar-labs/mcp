@@ -281,8 +281,9 @@ func (s *Server) Serve(ctx context.Context, l net.Listener, opts UnixOptions) er
 	}()
 
 	var (
-		wg      sync.WaitGroup
-		backoff time.Duration
+		wg           sync.WaitGroup
+		backoff      time.Duration
+		warnedNoCred bool
 	)
 	gate := newConnGate(opts.MaxConns, opts.MaxConnsPerUID)
 
@@ -312,6 +313,10 @@ func (s *Server) Serve(ctx context.Context, l net.Listener, opts UnixOptions) er
 		peer, credErr := peerCredentials(conn)
 		if !s.admit(conn, peer, credErr, opts) {
 			continue
+		}
+		if credErr != nil && opts.MaxConnsPerUID > 0 && !warnedNoCred {
+			warnedNoCred = true
+			s.opts.Logger.Printf("MaxConnsPerUID is not enforced: peer credentials unavailable: %v", credErr)
 		}
 		release, ok := gate.acquire(peer)
 		if !ok {

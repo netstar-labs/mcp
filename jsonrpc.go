@@ -126,7 +126,9 @@ func (m *wireMessage) validate() *RPCError {
 
 // checkVersion rejects a message whose "jsonrpc" member is not "2.0", whatever
 // its kind. It returns the id the error reply carries: the request's own, so
-// the caller can match it, and null for everything else, which has none.
+// the caller can match it, and null for everything else, which has none. The
+// error does not quote the peer's string, which has no length bound but the
+// frame's.
 func (m *wireMessage) checkVersion() (json.RawMessage, *RPCError) {
 	if m.JSONRPC == JSONRPCVersion {
 		return nil, nil
@@ -135,7 +137,7 @@ func (m *wireMessage) checkVersion() (json.RawMessage, *RPCError) {
 	if m.kind() == kindRequest {
 		id = m.ID
 	}
-	return id, Errorf(CodeInvalidRequest, "unsupported jsonrpc version %q", m.JSONRPC)
+	return id, Errorf(CodeInvalidRequest, "jsonrpc must be %q", JSONRPCVersion)
 }
 
 var nullLiteral = []byte("null")

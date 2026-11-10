@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -369,6 +372,26 @@ func TestHTTPPerIdentitySlotReleasedOnExpiry(t *testing.T) {
 	}
 }
 
+// wedge fills a session's outbound queue until its writer is blocked on a peer
+// that does not read. A queue that merely reports full may still be draining
+// into the socket buffer, so it keeps going until the queue is still full after
+// a pause.
+func wedge(t *testing.T, s *Session, frame []byte) {
+	t.Helper()
+	for i := 0; i < 5000; i++ {
+		if err := s.offer(frame); err == nil {
+			continue
+		} else if !errors.Is(err, errQueueFull) {
+			t.Fatalf("filling the queue: %v", err)
+		}
+		time.Sleep(40 * time.Millisecond)
+		if errors.Is(s.offer(frame), errQueueFull) {
+			return
+		}
+	}
+	t.Fatal("the writer never blocked: the test cannot stall this peer")
+}
+
 // Sessions that cannot take a notification are waited on together, so one
 // Broadcast costs one grace period however many peers have stopped reading.
 func TestBroadcastWaitsOnStalledPeersTogether(t *testing.T) {
@@ -379,10 +402,6 @@ func TestBroadcastWaitsOnStalledPeersTogether(t *testing.T) {
 	defer a.conn.Close()
 	defer b.conn.Close()
 
-	// Fill both sessions' outbound queues directly. A queue that merely reports
-	// full may still be draining into the socket buffer, so keep going until it
-	// is still full after a pause: the writer is then blocked on a peer that
-	// does not read.
 	frame, err := encodeNotification("notifications/test", map[string]string{"pad": strings.Repeat("x", 256<<10)})
 	if err != nil {
 		t.Fatal(err)
@@ -392,19 +411,7 @@ func TestBroadcastWaitsOnStalledPeersTogether(t *testing.T) {
 		t.Fatalf("%d sessions, want 2", len(sessions))
 	}
 	for _, s := range sessions {
-		stable := false
-		for i := 0; i < 5000 && !stable; i++ {
-			if err := s.offer(frame); err == nil {
-				continue
-			} else if !errors.Is(err, errQueueFull) {
-				t.Fatalf("filling the queue: %v", err)
-			}
-			time.Sleep(40 * time.Millisecond)
-			stable = errors.Is(s.offer(frame), errQueueFull)
-		}
-		if !stable {
-			t.Fatal("the writer never blocked: the test cannot stall this peer")
-		}
+		wedge(t, s, frame)
 	}
 
 	start := time.Now()
@@ -418,4 +425,172 @@ func TestBroadcastWaitsOnStalledPeersTogether(t *testing.T) {
 	}
 	// The registry drops a session when its ServeConn returns, just after Close.
 	eventually(t, "both stalled peers to be closed", func() bool { return len(h.srv.Sessions()) == 0 })
+}
+
+// Everything a queued request retains counts against the budget, not only the
+// members the dispatcher reads: a request that also carries a "result" or
+// "error" member is still a request, and the Session keeps the whole message.
+func TestQueuedBytesBudgetCountsUnreadMembers(t *testing.T) {
+	for _, member := range []string{"result", "error"} {
+		t.Run(member, func(t *testing.T) {
+			gate := make(chan struct{})
+			h := startServer(t, Options{MaxConcurrentRequests: 1, MaxQueuedBytes: 100_000}, UnixOptions{}, queueTool(gate))
+			c := h.client()
+			send := func() json.RawMessage {
+				c.id++
+				id := c.id
+				c.send(map[string]any{"jsonrpc": "2.0", "id": id, "method": MethodToolsCall,
+					"params": map[string]any{"name": "hold"},
+					member:   map[string]any{"pad": strings.Repeat("x", 40_000)}})
+				return json.RawMessage(fmt.Sprintf("%d", id))
+			}
+			send()
+			send()
+			id3 := send()
+			e := c.readErrorFrame()
+			if !strings.Contains(e.Error.Message, "overloaded") || string(e.ID) != string(id3) {
+				t.Fatalf("third request got id %s %+v, want an overloaded error for id %s", e.ID, e.Error, id3)
+			}
+			close(gate)
+		})
+	}
+}
+
+// A refused initialize must leave the counts exactly as it found them, even if
+// its handshake timer fires while it waits for the registry lock.
+func TestHTTPRefusedInitializeDoesNotUnbalanceTheCounts(t *testing.T) {
+	who := func(r *http.Request) string { return r.Header.Get("X-Caller") }
+	fx := newHTTPFixture(t, HTTPOptions{Identify: who, MaxSessionsPerIdentity: 1,
+		SessionTTL: time.Hour, HandshakeTimeout: 30 * time.Millisecond})
+
+	// alice's one session is Ready, so the short handshake timer leaves it alone.
+	resp := rpc(t, fx.ts.URL, "", initBody, "X-Caller", "alice")
+	sid := resp.Header.Get(headerSessionID)
+	_ = readBody(t, resp)
+	rpc(t, fx.ts.URL, sid, `{"jsonrpc":"2.0","method":"notifications/initialized"}`, "X-Caller", "alice")
+
+	// A second initialize, delayed at the registry lock for longer than its own
+	// handshake timer.
+	fx.h.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		req, _ := http.NewRequest(http.MethodPost, fx.ts.URL, strings.NewReader(initBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("X-Caller", "alice")
+		if r, err := http.DefaultClient.Do(req); err == nil {
+			_ = r.Body.Close()
+		}
+	}()
+	time.Sleep(150 * time.Millisecond)
+	fx.h.mu.Unlock()
+	<-done
+
+	// Let every timer that is going to fire do so, then compare the books.
+	time.Sleep(200 * time.Millisecond)
+	fx.h.mu.Lock()
+	defer fx.h.mu.Unlock()
+	live := 0
+	for _, s := range fx.h.sessions {
+		if s.owner == "alice" {
+			live++
+		}
+	}
+	if live != 1 || fx.h.owned["alice"] != 1 {
+		t.Fatalf("alice: %d live sessions, owned = %d; want 1 and 1", live, fx.h.owned["alice"])
+	}
+}
+
+// The rejection does not echo the peer's version string back: a notification
+// has no reply to amplify otherwise, and the string is the peer's to make as
+// long (and as expensive to quote) as the frame limit allows.
+func TestBadVersionRejectionDoesNotEchoThePeersString(t *testing.T) {
+	_, c := newTestServer(t, nil)
+	c.handshake()
+	c.send(map[string]any{"jsonrpc": strings.Repeat("\u0080", 100_000), "method": "notifications/x"})
+	e := c.readErrorFrame()
+	if e.Error.Code != CodeInvalidRequest {
+		t.Fatalf("code = %d", e.Error.Code)
+	}
+	if n := len(e.Error.Message); n > 200 {
+		t.Fatalf("rejection message is %d bytes for a 200000-byte version string", n)
+	}
+}
+
+// A peer that is reading, however slowly, is not closed: the grace is for a
+// peer that makes no progress, not a deadline on the whole wait. Here the
+// notification queues behind a full queue and 64 replies blocked on it, which a
+// slow reader needs far longer than the grace to drain.
+func TestBroadcastWaitsOnAPeerThatIsReadingSlowly(t *testing.T) {
+	h := startServer(t, Options{}, UnixOptions{}, nil)
+	const grace = 150 * time.Millisecond
+	h.srv.broadcastGrace = grace
+	c := h.client()
+	sess := h.srv.Sessions()[0]
+
+	frame, err := encodeNotification("notifications/test", map[string]string{"pad": strings.Repeat("x", 32<<10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wedge(t, sess, frame)
+	for i := 0; i < 64; i++ { // replies from busy handlers, ahead of the broadcast
+		go sess.sendRaw(frame)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	go func() { // the peer wakes up and reads one frame's worth every 10ms
+		buf := make([]byte, 32<<10)
+		for {
+			time.Sleep(10 * time.Millisecond)
+			_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := c.conn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	start := time.Now()
+	h.srv.Broadcast("notifications/test", struct{}{})
+	took := time.Since(start)
+	if st := sess.State(); st != StateReady {
+		t.Fatalf("a peer that was reading was closed (state %d) after %v", st, took)
+	}
+	if took < 2*grace {
+		t.Fatalf("Broadcast returned in %v: it did not have to wait, so the test measured nothing", took)
+	}
+}
+
+// logBuf is a log destination safe to read while a server is still logging.
+type logBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *logBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// Where the per-uid cap cannot be enforced, the server says so once, instead of
+// degrading silently (or once per connection).
+func TestPerUIDCapNotEnforcedIsLoggedOnce(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("peer credentials are readable on Linux, so the cap is enforced")
+	}
+	var lb logBuf
+	h := startServer(t, Options{Logger: log.New(&lb, "", 0)}, UnixOptions{MaxConnsPerUID: 8}, nil)
+	h.client()
+	h.client()
+	h.client()
+	if n := strings.Count(lb.String(), "MaxConnsPerUID is not enforced"); n != 1 {
+		t.Fatalf("logged %d times, want once; log:\n%s", n, lb.String())
+	}
 }

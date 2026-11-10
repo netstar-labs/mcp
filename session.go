@@ -83,6 +83,9 @@ type Session struct {
 	// queuedBytes is what the queued and running requests hold, against
 	// Options.MaxQueuedBytes.
 	queuedBytes atomic.Int64
+	// written counts the frames the writer has handed to the transport; a
+	// writer that is making progress has a peer that is reading.
+	written atomic.Uint64
 
 	mu         sync.Mutex
 	clientInfo Implementation
@@ -269,7 +272,7 @@ func (s *Session) handleFrame(ctx context.Context, frame []byte) {
 		s.sendError(id, rerr)
 		return
 	}
-	s.route(ctx, &wm)
+	s.route(ctx, &wm, len(trimmed))
 }
 
 // handleBatch runs the members of a JSON-RPC batch sequentially on the read loop.
@@ -334,7 +337,7 @@ func (s *Session) handleBatch(ctx context.Context, frame []byte) {
 	}
 }
 
-func (s *Session) route(ctx context.Context, wm *wireMessage) {
+func (s *Session) route(ctx context.Context, wm *wireMessage, frameBytes int) {
 	switch wm.kind() {
 	case kindRequest:
 		if wm.Method == MethodInitialize {
@@ -347,7 +350,7 @@ func (s *Session) route(ctx context.Context, wm *wireMessage) {
 			}
 			return
 		}
-		s.spawnRequest(ctx, wm)
+		s.spawnRequest(ctx, wm, frameBytes)
 	case kindNotification:
 		// Notifications are processed inline, in arrival order. Dispatching
 		// them concurrently would let a request overtake the
@@ -368,7 +371,7 @@ func (s *Session) route(ctx context.Context, wm *wireMessage) {
 // admitted up to maxQueue and then rejected; actual work is capped by the
 // semaphore, and keeping the read loop free is what lets a cancel through under
 // load.
-func (s *Session) spawnRequest(ctx context.Context, wm *wireMessage) {
+func (s *Session) spawnRequest(ctx context.Context, wm *wireMessage, frameBytes int) {
 	if s.queued.Add(1) > s.maxQueue {
 		s.queued.Add(-1)
 		s.sendError(wm.ID, Errorf(CodeInternalError, "server is overloaded; retry later"))
@@ -376,7 +379,10 @@ func (s *Session) spawnRequest(ctx context.Context, wm *wireMessage) {
 	}
 	// Only the read loop admits, so the check-then-add below cannot race with
 	// another admission; completions only lower the total.
-	size := int64(len(wm.Method) + len(wm.ID) + len(wm.Params))
+	// The whole frame is counted, not the members the dispatcher reads: the
+	// decoded message also keeps any "result" or "error" a request carries, and
+	// the frame's length bounds whatever it keeps.
+	size := int64(frameBytes)
 	if held := s.queuedBytes.Load(); held > 0 && held+size > int64(s.server.opts.MaxQueuedBytes) {
 		s.queued.Add(-1)
 		s.sendError(wm.ID, Errorf(CodeInternalError, "server is overloaded; too many request bytes queued; retry later"))
@@ -493,6 +499,7 @@ func (s *Session) writeLoop() {
 			_ = s.Close()
 			return false
 		}
+		s.written.Add(1)
 		return true
 	}
 	for {
@@ -599,19 +606,28 @@ func (s *Session) offer(frame []byte) error {
 	}
 }
 
-// offerWithin waits up to grace for room in the queue and closes the session if
-// there is none: a peer that does not drain for that long has stopped reading.
+// offerWithin waits for room in the queue and closes the session if the writer
+// makes no progress for grace: a peer that has stopped reading. A peer that is
+// reading, however slowly, is waited on, since the frame may be queued behind
+// every reply a busy session has in flight.
 func (s *Session) offerWithin(frame []byte, grace time.Duration) error {
 	t := time.NewTimer(grace)
 	defer t.Stop()
-	select {
-	case s.out <- frame:
-		return nil
-	case <-s.done:
-		return errSessionClosed
-	case <-t.C:
-		_ = s.Close()
-		return fmt.Errorf("closed: not reading for %v", grace)
+	for {
+		seen := s.written.Load()
+		select {
+		case s.out <- frame:
+			return nil
+		case <-s.done:
+			return errSessionClosed
+		case <-t.C:
+			if s.written.Load() != seen {
+				t.Reset(grace)
+				continue
+			}
+			_ = s.Close()
+			return fmt.Errorf("closed: not reading for %v", grace)
+		}
 	}
 }
 

@@ -26,8 +26,9 @@ const (
 	DefaultMaxBatchItems         = 64
 	DefaultMaxPendingCalls       = 256
 
-	// defaultBroadcastGrace is how long a fan-out waits on a session whose
-	// outbound queue is full before closing it.
+	// defaultBroadcastGrace is how long a fan-out lets a session whose
+	// outbound queue is full go without its writer making progress before
+	// closing it.
 	defaultBroadcastGrace = 5 * time.Second
 )
 
@@ -100,7 +101,7 @@ type Options struct {
 	MaxConcurrentRequests int
 
 	// MaxQueuedBytes bounds, per session, the bytes held by requests that are
-	// queued or running (their method, id and params). A request that would
+	// queued or running (counted as the length of each request's frame). A request that would
 	// exceed it is refused with the same "overloaded" error as one past the
 	// count limit, except that a request is always admitted when the session
 	// holds nothing else, so a small value never makes a large message
@@ -202,8 +203,9 @@ type Server struct {
 	templateCache listCache
 	promptCache   listCache
 
-	// broadcastGrace is how long a fan-out waits on a session whose outbound
-	// queue is full before closing it. A field so tests can shorten it.
+	// broadcastGrace is how long a fan-out lets a session whose outbound queue
+	// is full go without its writer making progress before closing it. A field
+	// so tests can shorten it.
 	broadcastGrace time.Duration
 
 	sessMu   sync.Mutex
@@ -405,13 +407,17 @@ func (s *Server) negotiate(requested string) string {
 
 // Broadcast sends a notification to every session that has completed
 // initialization. Errors are logged, not returned. A session whose outbound
-// queue is full is given a short grace period (the others are not held up by
-// it) and is then closed: a peer that has stopped reading loses its connection
+// queue is full is waited on, together with any others in that state, while
+// its writer keeps making progress, and is closed once the writer makes none for
+// a grace period (5s): a peer that has stopped reading loses its connection
 // rather than back-pressuring everyone, and a client that reconnects refreshes
-// what the notification would have told it. Broadcast therefore returns within
-// that grace period even with UnixOptions.WriteTimeout unset. Session.Notify,
-// by contrast, still blocks on a full queue, because ordering with replies
-// matters to its callers.
+// what the notification would have told it. A peer that is reading slowly is
+// not closed, but Broadcast then waits as long as the peer takes to drain what
+// is queued ahead of the frame (replies share the queue); only a peer that makes
+// no progress is bounded by the grace period, even with UnixOptions.WriteTimeout
+// unset. A single write of one very large frame that outlasts the grace counts as
+// no progress. Session.Notify, by contrast, still blocks on a full queue,
+// because ordering with replies matters to its callers.
 func (s *Server) Broadcast(method string, params any) {
 	var ready []*Session
 	for _, sess := range s.Sessions() {
@@ -426,7 +432,7 @@ func (s *Server) Broadcast(method string, params any) {
 
 // fanout delivers one notification to each of sessions. A session whose
 // queue has room gets it at once; those whose queue is full are waited on
-// together, for at most broadcastGrace, and closed if they still cannot take it.
+// together, and closed if their writer makes no progress for broadcastGrace.
 func (s *Server) fanout(sessions []*Session, method string, params any, logErr func(*Session, error)) {
 	frame, err := encodeNotification(method, params)
 	if err != nil {

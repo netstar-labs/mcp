@@ -49,6 +49,7 @@ Only the latest release is supported; versions are `v0.y.z`, and a fix ships as 
 - **Peer credentials off Linux.** On macOS and the BSDs UID/GID admission fails closed and
   socket-file permissions are the access control. The per-UID connection cap
   (`MaxConnsPerUID`, `mcpd -max-conns-per-uid`, default 8 in mcpd) is not counted there, so only
-  the total cap (`MaxConns`) bounds connections.
+  the total cap (`MaxConns`) bounds connections. The same holds on Linux for a listener that cannot
+  supply credentials (not a unix socket); `Serve` logs once that the cap is not enforced.
 - **Resumption, replay and cross-node sessions.** A frame in flight when an HTTP stream drops is
   lost, and sessions live in one process's memory.

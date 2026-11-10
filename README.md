@@ -186,7 +186,8 @@ longer knows the session ends the client with `ErrSessionExpired`: dial again.
   hold (default 8 × `MaxMessageBytes`), alongside the count limit; past it a request
   is refused as overloaded.
 - **`Broadcast` does not wait on a stuck peer.** A session whose outbound queue is
-  full gets a short grace period and is then closed; the others are served at once.
+  full is waited on while its writer makes progress and closed once it makes none for
+  5s; the others are served at once. A peer that is reading slowly is not closed.
 - **The HTTP transport bounds what a stranger can hold.** Sessions are capped
   (`MaxSessions`; `MaxSessionsPerIdentity` for a caller `Identify` names) and a session that has not finished the handshake is dropped on a
   short timer (`HandshakeTimeout`), so unauthenticated `initialize` requests cannot

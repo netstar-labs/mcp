@@ -555,8 +555,6 @@ func (h *httpHandler) create(r *http.Request) (*httpSession, int) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
-	s.idle = time.AfterFunc(h.opts.HandshakeTimeout, s.expire)
-	s.hs = time.AfterFunc(h.opts.HandshakeTimeout, s.handshakeExpired)
 
 	h.mu.Lock()
 	status := 0
@@ -568,8 +566,6 @@ func (h *httpHandler) create(r *http.Request) (*httpSession, int) {
 	}
 	if status != 0 {
 		h.mu.Unlock()
-		s.idle.Stop()
-		s.hs.Stop()
 		cancel()
 		return nil, status
 	}
@@ -578,6 +574,19 @@ func (h *httpHandler) create(r *http.Request) (*httpSession, int) {
 		h.owned[s.owner]++
 	}
 	h.mu.Unlock()
+
+	// The timers start only now, once the session is registered: a timer that
+	// fired for a session still waiting for a slot would close a session that
+	// holds none, and release one it never took. A session closed in the
+	// meantime (the Server shutting down) gets none.
+	s.mu.Lock()
+	select {
+	case <-s.closed:
+	default:
+		s.idle = time.AfterFunc(h.opts.HandshakeTimeout, s.expire)
+		s.hs = time.AfterFunc(h.opts.HandshakeTimeout, s.handshakeExpired)
+	}
+	s.mu.Unlock()
 
 	go func() {
 		err := h.srv.ServeConn(ctx, s, ConnConfig{

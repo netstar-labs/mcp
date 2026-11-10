@@ -44,18 +44,26 @@ existing callers may have relied on; the notes say which.
 - `jsonrpc` must be `"2.0"` on every message over stdio and sockets, as it already was for a single
   request and over HTTP: a notification or response with `"1.0"` or no version, and a batch
   member with either, is answered with an invalid-request error (null id unless it was a request)
-  and not processed. A peer that omits `jsonrpc` on `notifications/initialized` never becomes Ready.
+  and not processed; the error does not quote the peer's version string. A peer that omits
+  `jsonrpc` on `notifications/initialized` never becomes Ready. Unchanged: a non-string `jsonrpc`
+  is a parse error (null id), and member names match case-insensitively (`JSONRPC` is accepted).
   The Client still accepts any version from a server.
 - `Options.MaxQueuedBytes` (default 8 × `MaxMessageBytes`, 64 MiB at the default) bounds the bytes
   held by a session's queued and running requests; past it a request gets the "overloaded" error.
   A client pipelining many large requests now gets errors where it got silent queueing; one
   session could previously pin about 4 GiB.
 - `Server.Broadcast` and `NotifyResourceUpdated` no longer block on a peer that stopped reading:
-  a session whose outbound queue is full is given 5 s and then closed, and the other sessions are
-  served first. `Session.Notify` still blocks.
+  a session whose outbound queue is full is waited on while its writer makes progress and closed
+  once it makes none for 5 s; the other sessions are served first. A peer that reads slowly is
+  not closed, and `Broadcast` then waits as long as it takes to drain what is queued ahead of the
+  notification. `Session.Notify` still blocks.
 - `mcpd -socket` on macOS and the BSDs serves connections with the default flags. `MaxConnsPerUID`
-  alone no longer makes admission demand peer credentials; without them it is not counted. An
-  explicit policy (`RequirePeerCred`, `AllowUID`, `AllowGID`) still fails closed.
+  alone no longer makes admission demand peer credentials; a connection whose credentials cannot be
+  read is admitted and not counted per uid, and `Serve` logs that once. Linux behaviour is
+  unchanged for unix-socket listeners; on Linux a listener that cannot supply credentials (a
+  systemd-passed TCP socket, a wrapping `Listener`) used to refuse every connection under this
+  option and now serves them uncounted. An explicit policy (`RequirePeerCred`, `AllowUID`,
+  `AllowGID`) still fails closed.
 - `idKey` no longer converts out-of-range floats: the id `9223372036854775808.0` (2^63) aliased
   `9223372036854775807` on arm64 and not on amd64.
 
