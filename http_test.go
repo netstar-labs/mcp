@@ -734,17 +734,32 @@ func TestHTTPDisconnectDoesNotCancel(t *testing.T) {
 		t.Fatalf("a dropped connection ended the handler (%s); only notifications/cancelled should", what)
 	case <-time.After(300 * time.Millisecond):
 	}
-	// The waiter is gone: nothing leaks in the session.
-	eventually(t, "the abandoned POST's waiter to be released", func() bool {
+	// The POST is gone but the request is not: its id stays reserved (marked
+	// abandoned, so nothing is routed to a dead stream) until the Session answers
+	// it or the client cancels it, and then nothing is left behind.
+	waiters := func() (total, abandoned int) {
 		fx.h.mu.Lock()
 		defer fx.h.mu.Unlock()
 		for _, s := range fx.h.sessions {
 			s.mu.Lock()
-			n := len(s.waiters)
+			for _, w := range s.waiters {
+				total++
+				if w.abandoned {
+					abandoned++
+				}
+			}
 			s.mu.Unlock()
-			return n == 0
 		}
-		return false
+		return
+	}
+	eventually(t, "the abandoned POST's id to be marked abandoned", func() bool {
+		n, a := waiters()
+		return n == 1 && a == 1
+	})
+	rpc(t, fx.ts.URL, sid, `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`)
+	eventually(t, "the cancelled request's id to be released", func() bool {
+		n, _ := waiters()
+		return n == 0
 	})
 }
 
@@ -1070,5 +1085,25 @@ func TestHTTPStaleHandshakeTimerDoesNotKillReadySession(t *testing.T) {
 	s.expire() // the short timer, firing late
 	if fx.sessionCount() != 1 {
 		t.Fatal("a ready session that had been idle for milliseconds was evicted by the handshake timer")
+	}
+}
+
+// route never sends a frame to a POST that has gone: it would be lost. With the
+// only waiter abandoned the frame is held for the next stream instead.
+func TestHTTPRouteSkipsAbandonedWaiters(t *testing.T) {
+	fx := newHTTPFixture(t, HTTPOptions{})
+	s, _ := fx.h.create(httptest.NewRequest(http.MethodPost, "/", nil))
+	defer s.terminate()
+	wt, _ := s.register(json.RawMessage(`1`))
+	s.abandon(wt)
+	_ = s.WriteMessage([]byte(`{"jsonrpc":"2.0","method":"n"}`))
+	if len(wt.out) != 0 {
+		t.Fatal("a frame was routed to a POST that has gone")
+	}
+	s.mu.Lock()
+	held := len(s.backlog)
+	s.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("backlog holds %d frames, want the one that had nowhere to go", held)
 	}
 }

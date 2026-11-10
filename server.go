@@ -385,10 +385,11 @@ func (s *Server) negotiate(requested string) string {
 
 // Broadcast sends a notification to every session that has completed
 // initialization. Errors are logged, not returned. Note: it sends sequentially,
-// and Notify blocks on the session's outbound queue — so a client that stalls
-// its reads can hold up the broadcast unless a WriteTimeout is set (mcpd sets
-// one; the library default is 0). Set Options... WriteTimeout in production so
-// one wedged client cannot stall the others.
+// and on the stdio and Unix-socket transports Notify blocks on the session's
+// outbound queue, so a client that stalls its reads can hold up the broadcast
+// unless UnixOptions.WriteTimeout is set (default 0, disabled; mcpd sets 30s).
+// HTTP sessions never block here: their writes never wait, and each write to a
+// stream is bounded by HTTPOptions.WriteTimeout (default 30s).
 func (s *Server) Broadcast(method string, params any) {
 	for _, sess := range s.Sessions() {
 		if sess.State() != StateReady {

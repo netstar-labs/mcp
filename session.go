@@ -554,12 +554,9 @@ func marshalError(id json.RawMessage, e *RPCError) json.RawMessage {
 
 // Notify sends a notification to the client.
 func (s *Session) Notify(method string, params any) error {
-	encoded, err := marshal(params)
+	encoded, err := encodeParams(params)
 	if err != nil {
 		return err
-	}
-	if bytes.Equal(encoded, nullLiteral) {
-		encoded = nil
 	}
 	frame, err := marshal(outNotification{JSONRPC: JSONRPCVersion, Method: method, Params: encoded})
 	if err != nil {
@@ -602,13 +599,10 @@ func (s *Session) Call(ctx context.Context, method string, params, result any) e
 		s.pendMu.Unlock()
 	}
 
-	encoded, err := marshal(params)
+	encoded, err := encodeParams(params)
 	if err != nil {
 		cleanup()
 		return err
-	}
-	if bytes.Equal(encoded, nullLiteral) {
-		encoded = nil
 	}
 	frame, err := marshal(outRequest{JSONRPC: JSONRPCVersion, ID: rawID, Method: method, Params: encoded})
 	if err != nil {

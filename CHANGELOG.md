@@ -22,6 +22,25 @@ existing callers may have relied on; the notes say which.
   longer is.
 - A call on a client whose connection ended for a reason returns that reason; it returned "client
   closed".
+- `Client.Initialize` advertises the elicitation capability only when `ClientOptions.OnRequest`
+  is set (commit ed9b40f, after v0.2.0); v0.2.0 advertised it always, so a server's
+  `Session.Elicit` against a client with no handler now fails at the capability check instead of
+  mid-call with method-not-found.
+- `ClientOptions.HTTPClient == nil` means a client that follows no redirects (a 307/308 would
+  replay the POST, its body and the caller's credential headers to the redirect target); a
+  redirect is reported as an error. Supply your own `HTTPClient` to follow them.
+- `ListTools` returns an error once a server's listing exceeds 32 MiB across pages.
+- `UnixOptions.HandshakeTimeout` no longer sets a read deadline for the connection's whole life.
+  With `IdleTimeout == 0` ("disabled") a Ready session that was merely quiet was dropped after
+  `HandshakeTimeout` (30s under `mcpd`, which always sets one); the handshake itself is still
+  bounded by its own timer.
+- `mcpd`'s `read_file` and the `file://` template read regular files only, up to 1 MiB; a FIFO,
+  device or directory, or a larger file, is an error. (A FIFO under the root parked the handler
+  forever, and a larger reply is a frame a default client refuses, which ends its session.)
+- A client's `notifications/initialized` no longer carries `"params":null`; params are omitted, as
+  the Session already did.
+- `idKey` no longer converts out-of-range floats: the id `9223372036854775808.0` (2^63) aliased
+  `9223372036854775807` on arm64 and not on amd64.
 
 ### Added
 
@@ -49,13 +68,38 @@ existing callers may have relied on; the notes say which.
   shutdown, the bridge's bounds), the Client against a hand-played server, `Session.Elicit` /
   `CreateMessage` / outbound-call bounds, completion, resource/template/prompt lists, `list_changed`
   broadcasts, `ServeStdio`, `ListenAndServeUnix`, `mcpd`'s HTTP flags. Coverage of the root package
-  72.0% → 84.1%. Seven fuzz targets: both framers, the SSE reader, `Accept` parsing, id keys, URI
+  72.0% → about 85%. Seven fuzz targets: both framers, the SSE reader, `Accept` parsing, id keys, URI
   templates, the HTTP POST path.
 - `hack/gate.sh` (the commit gate), `hack/fuzz.sh`, CI (`.github/workflows/ci.yml`: test on Linux
   and macOS, fuzz, staticcheck, deadcode, tidy, govulncheck) and Dependabot for the pinned actions.
 
 ### Fixed
 
+Found by the A1 audit of this branch (records in `docs/audits/`); ids are the audit's.
+
+- A1 C-2: `streamFramer.Close` took the write lock before closing the connection, so a peer that
+  stopped reading blocked `Close`, and with it `Session.Close`, `Serve` on shutdown,
+  `Server.Close` and `Client.Close`, for as long as the peer cared to stay silent.
+- A1 C-3: `Client.call` ignored its context while the write to the peer was blocked, and so did
+  every caller queued behind it. A write abandoned for its context now sends
+  `notifications/cancelled`, since it may have reached the wire.
+- A1 C-13: header framing allocated the declared body length before any body byte arrived; 27
+  bytes of input could cost 8 MiB. It now grows as the body arrives.
+- A1 C-1: an HTTP request id could be reused after its POST dropped, while the Session was still
+  running the first call, and the first call's reply was delivered as the answer to the second. An
+  id now stays reserved until the Session answers it or the client cancels it.
+- A1 C-7: an open GET stream kept a session that never finished the handshake alive past
+  `HandshakeTimeout`, so one connection per slot defeated the option. The handshake has its own
+  timer, which a stream does not hold off.
+- A1 C-4: the HTTP client's exchange slots were released only when the server ended a POST, so 64
+  calls to a server that ignored cancellation left the client unable to make another. A cancelled
+  call now aborts its own POST, a request past the slots is refused at once, and a notification
+  waits a bounded time for a slot.
+- A1 C-5: an HTTP 200 JSON reply that was not the response to a request (a null-id error, a batch,
+  another id) left the call waiting for its deadline. It now fails the call.
+- A1 C-6: a notification the server rejected (a 401 on `notifications/initialized`) was
+  swallowed, so `Initialize` reported success. The write now returns the error.
+- A1 C-16, B-1: see the behaviour changes above.
 - The client answered a server's `ping` with method-not-found.
 - A blocked or re-entrant `OnRequest` handler stalled the client's read loop, so unrelated
   responses were not delivered and a handler that called back into the client deadlocked.
@@ -64,7 +108,7 @@ existing callers may have relied on; the notes say which.
 ## v0.2.0
 
 Adds the `Client` (`Dial`, `Initialize`, `ListTools`, `CallTool`), which shares the server's
-Framer, JSON-RPC and protocol types, and advertises elicitation only when a handler can answer it.
+Framer, JSON-RPC and protocol types.
 
 ## v0.1.0
 

@@ -31,6 +31,7 @@ mcp/
   dispatch_lists_test.go   completion, resources/templates/prompts lists, list_changed broadcasts
   transport_run_test.go    ServeStdio, ListenAndServeUnix
   fuzz_test.go      fuzz targets for every trust boundary
+  a1_*_test.go      regressions for the A1 audit's findings (docs/audits/a1.md)
   harden_test.go    limits, quotas, deadlines, injection, cache invalidation
   audit_fixes_test.go regressions: cursor-cache bound, large-id keys, dup Content-Length
   protocol_content_test.go  Content constructors, SessionFromContext
@@ -98,11 +99,13 @@ all sessions sharing one registry. `@name` selects the Linux abstract
 namespace. `FramingHeaders` switches to LSP-style `Content-Length` framing when
 something in the path mangles line boundaries.
 
-**systemd** — `ListenSystemd()` adopts `LISTEN_FDS` descriptors, so the daemon
-can be socket-activated and run unprivileged.
+**systemd** — `ListenSystemd()` adopts `LISTEN_FDS` descriptors, so a daemon built
+on this package can be socket-activated and run unprivileged. (`mcpd` itself does
+not call it: it binds its own `-socket`.)
 
 **Streamable HTTP** — `Server.HTTPHandler(HTTPOptions)` returns an `http.Handler`
-for revisions 2025-03-26 and 2025-06-18: `POST` carries client→server messages,
+(the transport as defined from revision 2025-03-26; the Server's usual version
+negotiation applies, so a 2024-11-05 client is also served over it): `POST` carries client→server messages,
 the reply is one JSON body or, when the server has something to say first (an
 elicitation, a progress notification), an SSE stream; `GET` opens a stream for
 server-initiated messages; `DELETE` ends the session. It reuses the Session
@@ -126,7 +129,7 @@ c := mcp.Dial(conn, mcp.ClientOptions{Info: mcp.Implementation{Name: "mcpgw", Ve
 defer c.Close()
 if _, err := c.Initialize(ctx); err != nil { /* … */ }
 tools, _ := c.ListTools(ctx)
-res, _ := c.CallTool(ctx, "resolve", map[string]any{"name": "example.com"})
+res, _ := c.CallTool(ctx, "resolve", map[string]any{"host": "example.com"})
 ```
 
 `Dial` runs a background read loop that correlates responses by id and dispatches
@@ -320,15 +323,17 @@ FUZZTIME=30s hack/fuzz.sh             # every fuzz target
 (Build/test standalone with `GOWORK=off`; the module has no third-party
 requires.)
 
-The module has 120 top-level tests, 84% statement coverage of the root package, and
-seven fuzz targets (the two framers, the SSE reader, `Accept` parsing, id keys, URI
-templates, and the HTTP POST path). Two tests skip off Linux, the ones that need
-`SO_PEERCRED`. The hardening controls were mutation-tested — neutering `sanitize`,
-the batch cap, cache invalidation and the integer id path each produces a failing
-test — and so were the HTTP transport's: removing the identity binding, the Origin
-and Host guards, the session cap, the handshake timer, the cancel handling, the
-non-blocking stream route, the backlog bound, the body cap, the version check, the
-duplicate-id check, or the client's ordering of notifications each fails a test.
+The tests cover about 85% of the root package's statements (`go test -cover .`), and
+there are seven fuzz targets (the two framers, the SSE reader, `Accept` parsing, id
+keys, URI templates, and the HTTP POST path). Two tests skip off Linux, the ones that
+need `SO_PEERCRED`. The hardening controls were mutation-tested — neutering
+`sanitize`, the batch cap, cache invalidation and the integer id path each produces
+a failing test — and so were the HTTP transport's and the A1 audit's fixes: removing
+the identity binding, the Origin and Host guards, the session cap, the handshake
+timers, the cancel handling, the non-blocking stream route, the backlog bound, the
+body cap, the version check, the duplicate-id and reserved-id checks, the client's
+ordering of notifications, its redirect refusal and its slot accounting each fails a
+test.
 
 The suite drives a real Unix socket with a hand-rolled client, so it exercises
 the wire format rather than the server's own encoder: handshake and version

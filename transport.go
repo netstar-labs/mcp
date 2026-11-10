@@ -353,11 +353,9 @@ func (s *Server) serveAccepted(ctx context.Context, c net.Conn, peer *PeerCred, 
 	// Deadlines are enforced at the conn, below the framer, so a stalled peer
 	// cannot pin a goroutine, a buffer and a file descriptor indefinitely.
 	wrapped := &deadlineConn{Conn: c, idle: opts.IdleTimeout, write: opts.WriteTimeout}
-	if opts.HandshakeTimeout > 0 && opts.IdleTimeout == 0 {
-		// Give the handshake its own read bound even when no idle timeout is
-		// configured.
-		wrapped.idle = opts.HandshakeTimeout
-	}
+	// The handshake is bounded by the timer in OnSession below, not by a read
+	// deadline: a deadline set here would last as long as the connection and drop a
+	// Ready session that is merely quiet, which IdleTimeout == 0 documents as allowed.
 
 	framer := NewFramer(wrapped, wrapped, FramerOptions{
 		Mode:            opts.Framing,

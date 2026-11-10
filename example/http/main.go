@@ -11,7 +11,9 @@
 //	  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
 //	  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 //
-// The reply carries an Mcp-Session-Id header; send it on every later request.
+// The reply carries an Mcp-Session-Id header; send it on every later request. Before
+// any other request, POST {"jsonrpc":"2.0","method":"notifications/initialized"}
+// with that header (the reply is 202); requests sent earlier are answered -32002.
 // The session belongs to the identity that created it: bob presenting alice's
 // session id is told the session does not exist.
 package main

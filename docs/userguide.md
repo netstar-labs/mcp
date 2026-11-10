@@ -53,7 +53,7 @@ defer c.Close()
 if _, err := c.Initialize(ctx); err != nil {           // handshake + notifications/initialized
     log.Fatal(err)
 }
-tools, _ := c.ListTools(ctx)                            // first page of tools
+tools, _ := c.ListTools(ctx)                            // every tool, following nextCursor
 res, err := c.CallTool(ctx, "sha256", map[string]any{"input": "hi"})
 // err is a JSON-RPC error (unknown tool, bad arguments);
 // a tool that ran and failed is res with res.IsError set.
@@ -117,8 +117,10 @@ hs := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeou
   one process in a load balancer.
 - **What a client sees.** `POST` with `Content-Type: application/json` and
   `Accept: application/json, text/event-stream`; the first request is `initialize`,
-  its reply carries `Mcp-Session-Id`, and every later request echoes it (and
-  `MCP-Protocol-Version`). A reply is one JSON body, or an SSE stream when the
+  its reply carries `Mcp-Session-Id`, then the client POSTs the
+  `notifications/initialized` notification (answered 202), and every later request
+  echoes the id (and `MCP-Protocol-Version`). Requests sent before the notification
+  are answered -32002 "session is initializing". A reply is one JSON body, or an SSE stream when the
   server had something to send first. `GET` (with `Accept: text/event-stream`) opens
   a stream for server-initiated messages; `DELETE` ends the session. 404 means the
   session is gone: initialize again.
@@ -165,8 +167,9 @@ mcpd -http 127.0.0.1:8080                               # streamable HTTP at /mc
   all sharing one registry. `@name` selects the Linux abstract namespace;
   `-framing headers` switches to `Content-Length` framing when line boundaries are
   at risk.
-- **systemd** — `ListenSystemd()` adopts `LISTEN_FDS`, so the daemon can be
-  socket-activated and run unprivileged.
+- **systemd** — library only: a program built on this package can call
+  `ListenSystemd()` to adopt `LISTEN_FDS` descriptors and serve them with
+  `Server.Serve`. `mcpd` does not; it always binds its own `-socket`.
 - **HTTP** — streamable HTTP via `Server.HTTPHandler` and `DialHTTP`; see the HTTP
   section above. A service that wants a gateway in front of its tool servers still
   has one: [`mcpgw`](https://github.com/netstar-labs/mcpgw).
@@ -176,9 +179,11 @@ mcpd -http 127.0.0.1:8080                               # streamable HTTP at /mc
 - **Prefer a UID/GID allow-list** (`-allow-uid`/`-allow-gid`) — enforced from
   kernel `SO_PEERCRED`, unforgeable, and the *only* authentication on an abstract
   socket. Peer creds are **Linux-only**; off-Linux, credential-gated admission
-  fails closed and socket-file permissions apply.
-- **Least privilege** — run unprivileged; socket-activate via systemd; the socket
-  is created under a umask and never exists wider than `-mode`.
+  fails closed and socket-file permissions apply. Note that `-max-conns-per-uid`
+  (default 8) is credential-gated too: on macOS and the BSDs `mcpd -socket …` with
+  default flags refuses every connection, so pass `-max-conns-per-uid 0` there.
+- **Least privilege** — run unprivileged (under a dedicated user, as the unit
+  `build/mcp --server` installs does); the socket is created under a umask and never exists wider than `-mode`.
 - **Limits are on by default** — `-max-conns`, `-max-conns-per-uid`, idle/write
   timeouts; a handler panic costs one request, not the session.
 - **`-http` binds loopback only** unless `-http-any-iface` is given, because the
@@ -187,7 +192,8 @@ mcpd -http 127.0.0.1:8080                               # streamable HTTP at /mc
 
 ## Build & deploy
 
-`build/mcp [--server] [user@host]` cross-compiles `mcpd` to `linux/amd64` with a
-`git describe` stamp, packages a self-contained installer + `.tgz` (with an
+`build/mcp [--server] [user@host]` cross-compiles `mcpd` to `linux/amd64`, records
+the `git describe` version in the `mcpd.version` install history (the binary itself
+carries no version stamp), packages a self-contained installer + `.tgz` (with an
 optional systemd unit under `--server`), and — given a host — scp's it over and
 installs via ssh.

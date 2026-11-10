@@ -1,5 +1,6 @@
 // Command mcpd is a reference MCP server built on the mcp package. It serves
-// stdio, a Unix-domain socket, or both at once from a single registry.
+// stdio, a Unix-domain socket, streamable HTTP, or any combination at once from a
+// single registry.
 //
 //	mcpd -stdio
 //	mcpd -socket /run/mcpd/mcpd.sock -mode 0660 -group analysts
@@ -20,6 +21,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -318,12 +320,44 @@ func registerTools(srv *mcp.Server, root string) {
 		if err != nil {
 			return mcp.ToolError("%v", err), nil
 		}
-		data, err := os.ReadFile(full)
+		data, err := readRegular(full)
 		if err != nil {
 			return mcp.ToolError("read: %v", err), nil
 		}
 		return mcp.ToolText("%s", string(data)), nil
 	}))
+}
+
+// maxReadFileBytes bounds what read_file and the file:// template return. A reply
+// larger than the client's MaxMessageBytes (8 MiB by default) is a frame the client
+// refuses, which ends its session, so the bound sits well under it.
+const maxReadFileBytes = 1 << 20
+
+// readRegular reads a regular file of at most maxReadFileBytes. Anything else under
+// the root (a FIFO, a device, a directory) is refused: opening a FIFO for reading
+// blocks until a writer appears, in a handler that cannot be cancelled, so the file
+// is opened non-blocking and its type checked before anything is read.
+func readRegular(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxReadFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxReadFileBytes {
+		return nil, fmt.Errorf("file is over the %d byte limit", maxReadFileBytes)
+	}
+	return data, nil
 }
 
 func registerResources(srv *mcp.Server, root string) {
@@ -366,7 +400,7 @@ func registerResources(srv *mcp.Server, root string) {
 		if err != nil {
 			return nil, mcp.Errorf(mcp.CodeInvalidParams, "%v", err)
 		}
-		data, err := os.ReadFile(full)
+		data, err := readRegular(full)
 		if err != nil {
 			return nil, mcp.Errorf(mcp.CodeResourceNotFound, "read %s: %v", uri, err)
 		}

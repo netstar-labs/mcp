@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,6 +18,10 @@ import (
 // knows its session (HTTP 404 on a request that carried a session id). The
 // session is gone for good: dial again.
 var ErrSessionExpired = errors.New("mcp: server no longer knows this session")
+
+// errHTTPBusy is returned by a write that cannot get one of the client's exchange
+// slots: a request when all are in use, a notification that waited notifyTimeout.
+var errHTTPBusy = errors.New("mcp: too many requests in flight to this server")
 
 const (
 	// maxHTTPClientExchanges bounds requests in flight from one client. Past it
@@ -43,7 +46,8 @@ const (
 // ctx bounds the connection's whole life, not any one call: cancelling it
 // closes the client. DialHTTP does no I/O, so its only errors are a bad
 // endpoint. Authentication is the caller's: put credentials in
-// ClientOptions.Header, or in the RoundTripper of ClientOptions.HTTPClient.
+// ClientOptions.Header, or in the RoundTripper of ClientOptions.HTTPClient. The
+// default client follows no redirects (a redirect is reported as an error).
 //
 // A server request (OnRequest) arrives on the stream of the POST it relates to
 // or, when the client has a handler, on a GET stream opened after initialize.
@@ -60,8 +64,11 @@ func DialHTTP(ctx context.Context, endpoint string, opts ClientOptions) (*Client
 	hc := opts.HTTPClient
 	if hc == nil {
 		// No Timeout: it would cut every SSE stream. Per-call deadlines are the
-		// context each call is given.
-		hc = &http.Client{}
+		// context each call is given. No redirects: a 307 or 308 replays the POST,
+		// its body, the session id and every credential header the caller set to
+		// wherever the response points, and net/http withholds only Authorization
+		// and Cookie across hosts. A caller who wants redirects supplies a client.
+		hc = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 	max := opts.MaxMessageBytes
 	if max <= 0 {
@@ -78,6 +85,7 @@ func DialHTTP(ctx context.Context, endpoint string, opts ClientOptions) (*Client
 		cancel:     cancel,
 		in:         make(chan []byte, httpClientQueue),
 		sem:        make(chan struct{}, maxHTTPClientExchanges),
+		calls:      make(map[string]context.CancelFunc),
 	}
 	return newClient(f, opts), nil
 }
@@ -107,11 +115,12 @@ type httpClientFramer struct {
 	wg     sync.WaitGroup
 
 	mu       sync.Mutex
-	closed   bool   // Close has begun: no goroutine may be added to wg after this
-	sid      string // Mcp-Session-Id, set by the initialize response
-	version  string // negotiated protocol version, sent on every later request
-	initKey  string // idKey of the initialize request
-	termErr  error  // why the connection ended, if not by Close
+	calls    map[string]context.CancelFunc // in-flight request exchanges, by idKey, so a cancelled call can abort its POST
+	closed   bool                          // Close has begun: no goroutine may be added to wg after this
+	sid      string                        // Mcp-Session-Id, set by the initialize response
+	version  string                        // negotiated protocol version, sent on every later request
+	initKey  string                        // idKey of the initialize request
+	termErr  error                         // why the connection ended, if not by Close
 	gotInit  bool
 	closing  sync.Once
 	finished bool // the session is gone; Close need not DELETE it
@@ -143,10 +152,27 @@ func (f *httpClientFramer) WriteMessage(p []byte) error {
 	if kind == kindInvalid {
 		return errors.New("mcp: not a JSON-RPC request, notification or response")
 	}
-	select {
-	case f.sem <- struct{}{}:
-	case <-f.ctx.Done():
-		return net.ErrClosed
+	if kind == kindNotification && m.Method == NotifyCancelled {
+		f.abortCall(m.Params) // frees the slot whether or not the server honours the cancel
+	}
+	if kind == kindRequest {
+		// A request never waits for a slot: past the limit the caller is told now,
+		// not left behind a stalled server it cannot see.
+		select {
+		case f.sem <- struct{}{}:
+		default:
+			return errHTTPBusy
+		}
+	} else {
+		t := time.NewTimer(notifyTimeout)
+		defer t.Stop()
+		select {
+		case f.sem <- struct{}{}:
+		case <-t.C:
+			return errHTTPBusy
+		case <-f.ctx.Done():
+			return net.ErrClosed
+		}
 	}
 	body := bytes.Clone(p)
 
@@ -156,23 +182,58 @@ func (f *httpClientFramer) WriteMessage(p []byte) error {
 		<-f.sem
 		return net.ErrClosed
 	}
-	if kind == kindRequest && m.Method == MethodInitialize {
-		f.initKey = idKey(m.ID)
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if kind == kindRequest {
+		if m.Method == MethodInitialize {
+			f.initKey = idKey(m.ID)
+		}
+		ctx, cancel = context.WithCancel(f.ctx)
+		f.calls[idKey(m.ID)] = cancel
+	} else {
+		// The caller is waiting on this, holding the client's write lock: bound
+		// it, so a server that never answers cannot freeze every later write.
+		ctx, cancel = context.WithTimeout(f.ctx, notifyTimeout)
 	}
 	f.wg.Add(1)
 	f.mu.Unlock()
 
-	run := func() {
+	run := func() error {
 		defer f.wg.Done()
 		defer func() { <-f.sem }()
-		f.exchange(kind, m.ID, m.Method, body)
+		defer cancel()
+		if kind == kindRequest {
+			defer func() {
+				f.mu.Lock()
+				delete(f.calls, idKey(m.ID))
+				f.mu.Unlock()
+			}()
+		}
+		return f.exchange(ctx, kind, m.ID, m.Method, body)
 	}
 	if kind == kindRequest {
-		go run()
-	} else {
-		run()
+		go func() { _ = run() }()
+		return nil
 	}
-	return nil
+	return run()
+}
+
+// abortCall ends the POST of a request the caller has cancelled. The caller is no
+// longer listening, and the exchange would otherwise hold its slot for as long as
+// the server cares to keep the POST open.
+func (f *httpClientFramer) abortCall(params json.RawMessage) {
+	var p CancelledParams
+	if json.Unmarshal(params, &p) != nil || len(p.RequestID) == 0 {
+		return
+	}
+	f.mu.Lock()
+	cancel := f.calls[idKey(p.RequestID)]
+	f.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // Close implements Framer: end the server's session (best effort, bounded), then
@@ -243,29 +304,24 @@ func (f *httpClientFramer) push(frame []byte) {
 	}
 }
 
-// failRequest answers a request the transport could not deliver an answer to, so
-// the call returns an error now rather than at its deadline. Notifications and
-// responses have no caller waiting.
-func (f *httpClientFramer) failRequest(kind msgKind, id json.RawMessage, err error) {
-	if kind != kindRequest || f.ctx.Err() != nil {
-		return
+// failRequest reports a message the transport could not complete. For a request it
+// answers with an error response, so the call returns now rather than at its
+// deadline, and returns nil; a notification or reply has no caller waiting on a
+// response, but its writer is waiting on the write, so the error is returned to it.
+func (f *httpClientFramer) failRequest(kind msgKind, id json.RawMessage, err error) error {
+	if kind != kindRequest {
+		return err
 	}
-	f.push(marshalError(id, Errorf(CodeInternalError, "mcp: http: %s", sanitize(err.Error()))))
+	if f.ctx.Err() == nil {
+		f.push(marshalError(id, Errorf(CodeInternalError, "mcp: http: %s", sanitize(err.Error()))))
+	}
+	return nil
 }
 
-func (f *httpClientFramer) exchange(kind msgKind, id json.RawMessage, method string, body []byte) {
-	ctx := f.ctx
-	if kind != kindRequest {
-		// The caller is waiting on this, holding the client's write lock: bound
-		// it, so a server that never answers cannot freeze every later write.
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, notifyTimeout)
-		defer cancel()
-	}
+func (f *httpClientFramer) exchange(ctx context.Context, kind msgKind, id json.RawMessage, method string, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.url, bytes.NewReader(body))
 	if err != nil {
-		f.failRequest(kind, id, err)
-		return
+		return f.failRequest(kind, id, err)
 	}
 	init := kind == kindRequest && method == MethodInitialize
 	f.decorate(req, init)
@@ -274,16 +330,14 @@ func (f *httpClientFramer) exchange(kind msgKind, id json.RawMessage, method str
 
 	resp, err := f.hc.Do(req)
 	if err != nil {
-		f.failRequest(kind, id, err)
-		return
+		return f.failRequest(kind, id, err)
 	}
 	defer resp.Body.Close()
 
 	if init && resp.StatusCode/100 == 2 {
 		if sid := resp.Header.Get(headerSessionID); sid != "" {
 			if !validSessionID(sid) {
-				f.failRequest(kind, id, errors.New("server sent an invalid "+headerSessionID))
-				return
+				return f.failRequest(kind, id, errors.New("server sent an invalid "+headerSessionID))
 			}
 			f.mu.Lock()
 			f.sid = sid
@@ -293,28 +347,37 @@ func (f *httpClientFramer) exchange(kind msgKind, id json.RawMessage, method str
 	switch {
 	case resp.StatusCode == http.StatusNotFound && f.hasSession():
 		f.terminate(ErrSessionExpired)
+		if kind != kindRequest {
+			return ErrSessionExpired
+		}
 	case resp.StatusCode/100 != 2:
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPErrorBody))
-		f.failRequest(kind, id, fmt.Errorf("server answered %d: %s", resp.StatusCode, snippet))
+		return f.failRequest(kind, id, fmt.Errorf("server answered %d: %s", resp.StatusCode, snippet))
 	case resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusNoContent:
 		if kind == kindRequest {
-			f.failRequest(kind, id, fmt.Errorf("server answered %d to a request", resp.StatusCode))
+			return f.failRequest(kind, id, fmt.Errorf("server answered %d to a request", resp.StatusCode))
 		}
-	case isSSE(resp.Header.Get("Content-Type")):
+	case isMediaType(resp.Header.Get("Content-Type"), "text/event-stream"):
 		f.readStream(resp.Body, kind, id)
-	case isJSONContentType(resp.Header.Get("Content-Type")):
+	case isMediaType(resp.Header.Get("Content-Type"), "application/json"):
 		raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(f.max)+1))
 		switch {
 		case err != nil:
-			f.failRequest(kind, id, err)
+			return f.failRequest(kind, id, err)
 		case len(raw) > f.max:
-			f.failRequest(kind, id, ErrMessageTooLarge)
-		default:
-			f.deliver(bytes.TrimSpace(raw))
+			return f.failRequest(kind, id, ErrMessageTooLarge)
+		}
+		// A JSON reply to a request must be that request's response. A null-id
+		// error (JSON-RPC 5: what a server sends for a request it cannot attribute),
+		// a batch or another id would otherwise leave the call waiting for a reply
+		// that has already come.
+		if got := f.deliver(bytes.TrimSpace(raw)); kind == kindRequest && got != idKey(id) {
+			return f.failRequest(kind, id, errors.New("the server's reply is not a response to the request"))
 		}
 	default:
-		f.failRequest(kind, id, fmt.Errorf("unexpected Content-Type %q", sanitize(resp.Header.Get("Content-Type"))))
+		return f.failRequest(kind, id, fmt.Errorf("unexpected Content-Type %q", sanitize(resp.Header.Get("Content-Type"))))
 	}
+	return nil
 }
 
 func (f *httpClientFramer) hasSession() bool {
@@ -423,7 +486,7 @@ func (f *httpClientFramer) getLoop() {
 				_ = resp.Body.Close()
 				f.terminate(ErrSessionExpired)
 				return
-			case code == http.StatusOK && isSSE(resp.Header.Get("Content-Type")):
+			case code == http.StatusOK && isMediaType(resp.Header.Get("Content-Type"), "text/event-stream"):
 				backoff = time.Second
 				f.readStream(resp.Body, kindNotification, nil)
 			case code >= 400 && code < 500:
@@ -439,11 +502,6 @@ func (f *httpClientFramer) getLoop() {
 		}
 		backoff = min(backoff*2, 30*time.Second)
 	}
-}
-
-func isSSE(contentType string) bool {
-	mt, _, err := mime.ParseMediaType(contentType)
-	return err == nil && mt == "text/event-stream"
 }
 
 // validSessionID reports whether v is a legal Mcp-Session-Id: visible ASCII only

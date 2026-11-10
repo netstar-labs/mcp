@@ -22,11 +22,17 @@ const (
 	// maxListPages bounds how many pages ListTools follows, so a server that
 	// never stops returning a cursor cannot hold the client forever.
 	maxListPages = 1000
+
+	// maxListBytes bounds what ListTools retains across pages. A page is already
+	// capped at MaxMessageBytes; without this a hostile server could still make
+	// the client hold a thousand of them.
+	maxListBytes = 32 << 20
 )
 
 // Client is a minimal MCP client over a Framer. It performs the initialize
-// handshake, lists and calls tools, and dispatches server→client requests
-// (elicitation/create, sampling/createMessage, roots/list) to a handler. A
+// handshake, lists and calls tools, answers ping, and dispatches server→client
+// requests to a handler (only elicitation is advertised, so only elicitation/create
+// is expected; a handler receives any other method a server sends anyway). A
 // background goroutine reads the stream and correlates responses by id; every
 // public method is safe for concurrent use.
 //
@@ -146,6 +152,7 @@ func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
 		tools  []Tool
 		cursor string
 		seen   = map[string]struct{}{}
+		held   int
 	)
 	for range maxListPages {
 		raw, err := c.call(ctx, MethodToolsList, PaginatedParams{Cursor: cursor})
@@ -155,6 +162,9 @@ func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
 		var res ListToolsResult
 		if err := json.Unmarshal(raw, &res); err != nil {
 			return nil, err
+		}
+		if held += len(raw); held > maxListBytes {
+			return nil, fmt.Errorf("mcp: server's tool listing exceeds %d bytes", maxListBytes)
 		}
 		tools = append(tools, res.Tools...)
 		if res.NextCursor == "" {
@@ -204,7 +214,7 @@ func (c *Client) Close() error {
 // ---- internals ----
 
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	pb, err := marshal(params)
+	pb, err := encodeParams(params)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +247,13 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	if err != nil {
 		return nil, err
 	}
-	if err := c.write(req); err != nil {
+	if err := c.writeCtx(ctx, req); err != nil {
+		// A write abandoned because the call's context ended may or may not have
+		// reached the wire, so the server is told to stop either way (harmless if
+		// it never saw the request).
+		if ctx.Err() != nil {
+			c.cancelRemote(method, idRaw, ctx.Err())
+		}
 		return nil, err
 	}
 
@@ -248,21 +264,27 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 		}
 		return m.Result, nil
 	case <-ctx.Done():
-		// Tell the server to stop working on it (utilities/cancellation), except
-		// for initialize, which the spec forbids cancelling. Best effort, and off
-		// this goroutine: a peer that has stopped reading would otherwise make a
-		// cancelled call outlive its own context. The write ends when Close does.
-		if method != MethodInitialize {
-			go func() { _ = c.notify(NotifyCancelled, CancelledParams{RequestID: idRaw, Reason: ctx.Err().Error()}) }()
-		}
+		c.cancelRemote(method, idRaw, ctx.Err())
 		return nil, ctx.Err()
 	case <-c.done:
 		return nil, c.readErr()
 	}
 }
 
+// cancelRemote tells the server to stop working on a request the caller has given
+// up on (utilities/cancellation), except for initialize, which the spec forbids
+// cancelling. Best effort, and off this goroutine: a peer that has stopped reading
+// would otherwise make a cancelled call outlive its own context. The write ends when
+// Close does.
+func (c *Client) cancelRemote(method string, id json.RawMessage, why error) {
+	if method == MethodInitialize {
+		return
+	}
+	go func() { _ = c.notify(NotifyCancelled, CancelledParams{RequestID: id, Reason: why.Error()}) }()
+}
+
 func (c *Client) notify(method string, params any) error {
-	pb, err := marshal(params)
+	pb, err := encodeParams(params)
 	if err != nil {
 		return err
 	}
@@ -271,6 +293,34 @@ func (c *Client) notify(method string, params any) error {
 		return err
 	}
 	return c.write(raw)
+}
+
+// writeCtx writes a request without letting the caller's deadline depend on the
+// peer. A write to a peer that has stopped reading blocks, and so does waiting for
+// the write lock behind another such write; neither may outlive the call that is
+// waiting. The write itself is not aborted once it has begun (that would leave half
+// a frame on the wire), only abandoned by the caller; a write still queued for the
+// lock when its call has given up is skipped, so a stall clearing does not release a
+// burst of requests nobody is waiting for.
+func (c *Client) writeCtx(ctx context.Context, raw []byte) error {
+	res := make(chan error, 1)
+	go func() {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		if err := ctx.Err(); err != nil {
+			res <- err
+			return
+		}
+		res <- c.fr.WriteMessage(raw)
+	}()
+	select {
+	case err := <-res:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return c.readErr()
+	}
 }
 
 func (c *Client) write(raw []byte) error {

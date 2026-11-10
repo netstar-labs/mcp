@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,10 @@ const (
 // sessions, which is a memory-exhaustion vector wearing a performance
 // costume. Frames larger than the buffer are read incrementally.
 const DefaultBufferSize = 4096
+
+// headerBodyChunk is how much of a header-framed body is read, and the buffer
+// grown for it, at a time.
+const headerBodyChunk = 64 << 10
 
 // Framer reads and writes complete protocol frames over a byte stream.
 // A Framer is not safe for concurrent writers; the session serialises all
@@ -180,13 +185,21 @@ func (f *streamFramer) readHeaderFramed() ([]byte, error) {
 	if length > f.max {
 		return nil, ErrMessageTooLarge
 	}
-	if cap(f.scratch) < length {
-		f.scratch = make([]byte, length)
+	// Grow as the body arrives. Allocating the declared length first would let a
+	// peer that sends a header and then nothing hold f.max bytes for 27 bytes of
+	// input; the line reader already follows the bytes received, and so does this.
+	body := f.scratch[:0]
+	for len(body) < length {
+		n := min(length-len(body), headerBodyChunk)
+		body = slices.Grow(body, n)
+		m, err := io.ReadFull(f.r, body[len(body):len(body)+n])
+		body = body[:len(body)+m]
+		if err != nil {
+			f.scratch = body[:0]
+			return nil, err
+		}
 	}
-	body := f.scratch[:length]
-	if _, err := io.ReadFull(f.r, body); err != nil {
-		return nil, err
-	}
+	f.scratch = body
 	f.dropOversizedScratch() // body keeps its backing; release the oversized scratch
 	return body, nil
 }
@@ -249,9 +262,13 @@ func (f *streamFramer) WriteMessage(p []byte) error {
 }
 
 func (f *streamFramer) Close() error {
-	f.wmu.Lock()
-	_ = f.w.Flush()
-	f.wmu.Unlock()
+	// A writer blocked in Write holds wmu, and closing the connection is the only
+	// thing that ends that write, so Close must not wait for the lock: flush what
+	// can be flushed without waiting, then close.
+	if f.wmu.TryLock() {
+		_ = f.w.Flush()
+		f.wmu.Unlock()
+	}
 	if f.closer != nil {
 		return f.closer.Close()
 	}

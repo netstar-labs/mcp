@@ -46,6 +46,8 @@ Only the latest release is supported; versions are `v0.y.z`, and a fix ships as 
 - **A malicious tool handler.** Handlers run with the process's privileges. `ToolAnnotations` are
   server-supplied hints and are untrusted by construction; nothing here treats them as a control.
 - **Peer credentials off Linux.** On macOS and the BSDs UID/GID admission fails closed and
-  socket-file permissions are the access control.
+  socket-file permissions are the access control. The per-UID connection cap
+  (`MaxConnsPerUID`, `mcpd -max-conns-per-uid`, default 8 in mcpd) also needs credentials, so
+  there `mcpd -socket` refuses every connection unless `-max-conns-per-uid 0` is given.
 - **Resumption, replay and cross-node sessions.** A frame in flight when an HTTP stream drops is
   lost, and sessions live in one process's memory.

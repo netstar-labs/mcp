@@ -201,7 +201,7 @@ func httpFail(w http.ResponseWriter, status, code int, msg string) {
 // ---- POST ----
 
 func (h *httpHandler) post(w http.ResponseWriter, r *http.Request) {
-	if !isJSONContentType(r.Header.Get("Content-Type")) {
+	if !isMediaType(r.Header.Get("Content-Type"), "application/json") {
 		httpFail(w, http.StatusUnsupportedMediaType, CodeInvalidRequest, "Content-Type must be application/json")
 		return
 	}
@@ -292,12 +292,13 @@ func (h *httpHandler) post(w http.ResponseWriter, r *http.Request) {
 			httpFail(w, http.StatusBadRequest, CodeInvalidRequest, "a request with that id is already in flight")
 			return
 		}
-		defer s.unregister(wt)
 		if !h.enqueue(w, s, body) {
+			s.unregister(wt) // never reached the Session
 			return
 		}
 		committed = true
 		h.await(w, r, s, wt, creating)
+		s.abandon(wt)
 	}
 }
 
@@ -546,11 +547,13 @@ func (h *httpHandler) create(r *http.Request) (*httpSession, int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	s.idle = time.AfterFunc(h.opts.HandshakeTimeout, s.expire)
+	s.hs = time.AfterFunc(h.opts.HandshakeTimeout, s.handshakeExpired)
 
 	h.mu.Lock()
 	if len(h.sessions) >= h.opts.MaxSessions {
 		h.mu.Unlock()
 		s.idle.Stop()
+		s.hs.Stop()
 		cancel()
 		return nil, http.StatusServiceUnavailable
 	}
@@ -616,7 +619,8 @@ type httpSession struct {
 	backlog [][]byte
 	active  int // requests in flight plus open streams
 	idle    *time.Timer
-	lastUse time.Time // when active last fell to zero
+	hs      *time.Timer // the handshake deadline: unlike idle, an open stream does not hold it off
+	lastUse time.Time   // when active last fell to zero
 }
 
 // httpWaiter is one POST request waiting for its response.
@@ -627,6 +631,7 @@ type httpWaiter struct {
 	out       chan []byte   // server→client frames routed to this POST's stream
 	cancelled chan struct{} // closed when the client cancels the request
 	cancelOne sync.Once
+	abandoned bool // the POST has gone; the id stays reserved until the Session answers it
 }
 
 // httpStream is the session's open GET stream.
@@ -719,6 +724,9 @@ func (s *httpSession) route(frame []byte) {
 	}
 	var oldest *httpWaiter
 	for _, wt := range s.waiters {
+		if wt.abandoned {
+			continue // its POST is gone; a frame sent there is lost
+		}
 		if oldest == nil || wt.seq < oldest.seq {
 			oldest = wt
 		}
@@ -747,6 +755,9 @@ func (s *httpSession) Close() error {
 		s.mu.Lock()
 		if s.idle != nil {
 			s.idle.Stop()
+		}
+		if s.hs != nil {
+			s.hs.Stop()
 		}
 		if s.get != nil {
 			s.get.kick()
@@ -824,6 +835,19 @@ func (s *httpSession) expire() {
 	s.terminate()
 }
 
+// handshakeExpired drops a session that has not finished the handshake. It is
+// separate from the idle timer because an open GET stream holds that one off, and a
+// stream opened right after initialize must not let a session that never sends
+// notifications/initialized keep its slot.
+func (s *httpSession) handshakeExpired() {
+	s.mu.Lock()
+	ready := s.sess != nil && s.sess.State() == StateReady
+	s.mu.Unlock()
+	if !ready {
+		s.terminate()
+	}
+}
+
 // register adds a waiter for a request id; false when that id is already in
 // flight on this session, which the Session's own in-flight table could not
 // tell apart.
@@ -846,12 +870,25 @@ func (s *httpSession) register(id json.RawMessage) (*httpWaiter, bool) {
 	return wt, true
 }
 
-// unregister removes a waiter that is still registered (the POST ended before
-// the response arrived).
+// unregister removes a waiter whose request never reached the Session.
 func (s *httpSession) unregister(wt *httpWaiter) {
 	s.mu.Lock()
 	if s.waiters[wt.key] == wt {
 		delete(s.waiters, wt.key)
+	}
+	s.mu.Unlock()
+}
+
+// abandon is called when a POST ends. If the Session has already answered, the
+// waiter is gone from the table and there is nothing to do. If not (the client
+// dropped the connection, and the request keeps running) the id stays reserved: a
+// retry that reused it would otherwise be handed the first call's reply, and the
+// Session's own in-flight table, which holds one entry per id, would be overwritten.
+// The entry is removed when the Session answers, or when the client cancels.
+func (s *httpSession) abandon(wt *httpWaiter) {
+	s.mu.Lock()
+	if s.waiters[wt.key] == wt {
+		wt.abandoned = true
 	}
 	s.mu.Unlock()
 }
@@ -864,8 +901,12 @@ func (s *httpSession) cancelWaiter(params json.RawMessage) {
 	if json.Unmarshal(params, &p) != nil || len(p.RequestID) == 0 {
 		return
 	}
+	key := idKey(p.RequestID)
 	s.mu.Lock()
-	wt := s.waiters[idKey(p.RequestID)]
+	wt := s.waiters[key]
+	if wt != nil {
+		delete(s.waiters, key) // the Session suppresses a cancelled request's reply, so nothing else would
+	}
 	s.mu.Unlock()
 	if wt != nil {
 		wt.cancelOne.Do(func() { close(wt.cancelled) })
@@ -907,9 +948,11 @@ func (st *httpStream) kick() { st.once.Do(func() { close(st.kicked) }) }
 
 // ---- header parsing ----
 
-func isJSONContentType(v string) bool {
-	mt, _, err := mime.ParseMediaType(v)
-	return err == nil && mt == "application/json"
+// isMediaType reports whether a Content-Type header names mediaType, ignoring
+// parameters such as charset.
+func isMediaType(header, mediaType string) bool {
+	mt, _, err := mime.ParseMediaType(header)
+	return err == nil && mt == mediaType
 }
 
 // accepts reports whether an Accept header admits a media type. An absent header

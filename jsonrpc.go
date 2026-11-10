@@ -196,8 +196,13 @@ func idKey(raw json.RawMessage) string {
 	}
 	if f, err := strconv.ParseFloat(ts, 64); err == nil {
 		// Integral floats normalise to the integer form so 7 and 7.0 agree.
-		if n := int64(f); float64(n) == f {
-			return string(strconv.AppendInt(append(buf[:0], 'n', ':'), n, 10))
+		// Only in-range values are converted: out of range, the result of int64(f)
+		// is implementation-defined, and 2^63 aliased 2^63-1 on arm64 but not amd64.
+		const two63 = 1 << 63
+		if f >= -two63 && f < two63 {
+			if n := int64(f); float64(n) == f {
+				return string(strconv.AppendInt(append(buf[:0], 'n', ':'), n, 10))
+			}
 		}
 		return string(strconv.AppendFloat(append(buf[:0], 'n', ':'), f, 'g', -1, 64))
 	}
@@ -260,6 +265,21 @@ func marshal(v any) ([]byte, error) {
 		encPool.Put(e)
 	}
 	return out, nil
+}
+
+// encodeParams marshals the params of an outgoing request or notification, and
+// maps "no params" (nil, which marshals to null) to an absent member: null is not a
+// legal params value, and the Session, the Client and the HTTP client must agree on
+// the shape they put on the wire.
+func encodeParams(v any) (json.RawMessage, error) {
+	b, err := marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if bytes.Equal(b, nullLiteral) {
+		return nil, nil
+	}
+	return b, nil
 }
 
 // unmarshalParams decodes request params, tolerating an absent params member.

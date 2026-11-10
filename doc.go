@@ -16,8 +16,8 @@
 //
 // A Client (Dial over a byte stream, DialHTTP over streamable HTTP) drives
 // another server: initialize, list tools, call a tool, and answer the server's
-// own requests (elicitation, sampling, roots). It is deliberately small; see
-// Client for what it leaves out.
+// elicitation requests and pings. It is deliberately small; see Client for what
+// it leaves out.
 //
 // # Trust
 //
