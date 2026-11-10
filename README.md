@@ -180,9 +180,15 @@ longer knows the session ends the client with `ErrSessionExpired`: dial again.
   the session writer and back-pressure every handler behind it.
 - **`MaxConnsPerUID`** stops one local account from consuming the whole
   connection budget, which matters most on an abstract socket where filesystem
-  permissions do not apply.
+  permissions do not apply. It needs peer credentials, so off Linux it is not
+  counted (it does not refuse connections) and only `MaxConns` applies.
+- **`MaxQueuedBytes`** bounds the bytes a session's queued and running requests
+  hold (default 8 × `MaxMessageBytes`), alongside the count limit; past it a request
+  is refused as overloaded.
+- **`Broadcast` does not wait on a stuck peer.** A session whose outbound queue is
+  full gets a short grace period and is then closed; the others are served at once.
 - **The HTTP transport bounds what a stranger can hold.** Sessions are capped
-  (`MaxSessions`) and a session that has not finished the handshake is dropped on a
+  (`MaxSessions`; `MaxSessionsPerIdentity` for a caller `Identify` names) and a session that has not finished the handshake is dropped on a
   short timer (`HandshakeTimeout`), so unauthenticated `initialize` requests cannot
   park on slots for the full idle TTL; idle sessions expire (`SessionTTL`); a request
   body is read through the Server's `MaxMessageBytes`; the queue to the Session and

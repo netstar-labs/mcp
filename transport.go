@@ -70,7 +70,9 @@ type UnixOptions struct {
 
 	// MaxConnsPerUID bounds concurrent connections from any single peer uid,
 	// so one local account cannot exhaust the whole connection budget.
-	// Requires readable peer credentials. Zero means unlimited.
+	// Needs readable peer credentials (Linux); where they are unavailable
+	// connections are not counted per uid, and only MaxConns applies. Zero
+	// means unlimited.
 	MaxConnsPerUID int
 
 	// HandshakeTimeout drops connections that have not completed the
@@ -332,8 +334,10 @@ func (s *Server) Serve(ctx context.Context, l net.Listener, opts UnixOptions) er
 
 // admit applies credential policy before any protocol byte is read.
 func (s *Server) admit(c net.Conn, peer *PeerCred, credErr error, opts UnixOptions) bool {
-	needCred := opts.RequirePeerCred || opts.MaxConnsPerUID > 0 ||
-		len(opts.AllowUID) > 0 || len(opts.AllowGID) > 0
+	// MaxConnsPerUID is deliberately not here: it is a resource bound, not a
+	// credential policy, so where credentials cannot be read it degrades to
+	// untracked (see connGate) instead of refusing every connection.
+	needCred := opts.RequirePeerCred || len(opts.AllowUID) > 0 || len(opts.AllowGID) > 0
 	if credErr != nil && needCred {
 		s.opts.Logger.Printf("rejecting connection: peer credentials unavailable: %v", credErr)
 		_ = c.Close()

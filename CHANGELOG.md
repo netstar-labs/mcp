@@ -41,6 +41,21 @@ existing callers may have relied on; the notes say which.
   forever, and a larger reply is a frame a default client refuses, which ends its session.)
 - A client's `notifications/initialized` no longer carries `"params":null`; params are omitted, as
   the Session already did.
+- `jsonrpc` must be `"2.0"` on every message over stdio and sockets, as it already was for a single
+  request and over HTTP: a notification or response with `"1.0"` or no version, and a batch
+  member with either, is answered with an invalid-request error (null id unless it was a request)
+  and not processed. A peer that omits `jsonrpc` on `notifications/initialized` never becomes Ready.
+  The Client still accepts any version from a server.
+- `Options.MaxQueuedBytes` (default 8 × `MaxMessageBytes`, 64 MiB at the default) bounds the bytes
+  held by a session's queued and running requests; past it a request gets the "overloaded" error.
+  A client pipelining many large requests now gets errors where it got silent queueing; one
+  session could previously pin about 4 GiB.
+- `Server.Broadcast` and `NotifyResourceUpdated` no longer block on a peer that stopped reading:
+  a session whose outbound queue is full is given 5 s and then closed, and the other sessions are
+  served first. `Session.Notify` still blocks.
+- `mcpd -socket` on macOS and the BSDs serves connections with the default flags. `MaxConnsPerUID`
+  alone no longer makes admission demand peer credentials; without them it is not counted. An
+  explicit policy (`RequirePeerCred`, `AllowUID`, `AllowGID`) still fails closed.
 - `idKey` no longer converts out-of-range floats: the id `9223372036854775808.0` (2^63) aliased
   `9223372036854775807` on arm64 and not on amd64.
 
@@ -64,6 +79,8 @@ existing callers may have relied on; the notes say which.
 - `CodeRequestCancelled` (-32800).
 - `mcpd -http`, `-http-origin`, `-http-host`, `-http-any-iface`; `-http` refuses a non-loopback
   address unless `-http-any-iface` is given. `example/http`: a tool behind a bearer-token wrapper.
+- `HTTPOptions.MaxSessionsPerIdentity` (default 0, off): bounds the live sessions one `Identify`
+  result may hold; initialize past it is answered 429. Sessions with no identity are not counted.
 - Package documentation (`doc.go`), `SECURITY.md`, this changelog.
 - Tests: the HTTP transport over a real listener (round trips, a differential against the pipe
   transport, elicitation over a POST stream and a GET stream, admission, sessions, cancellation,

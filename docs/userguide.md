@@ -111,7 +111,8 @@ hs := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeou
 - **Timeouts on the `http.Server`.** Set `ReadHeaderTimeout` and `ReadTimeout`. Do
   not set `WriteTimeout`: it would end every SSE stream (the transport puts its own
   deadline on each stream write, `HTTPOptions.WriteTimeout`).
-- **Sessions.** `MaxSessions` (default 1024), `HandshakeTimeout` (30s: a session
+- **Sessions.** `MaxSessions` (default 1024), `MaxSessionsPerIdentity` (default 0,
+  off; counts only sessions whose `Identify` result is non-empty), `HandshakeTimeout` (30s: a session
   that never finishes the handshake is dropped), `SessionTTL` (30m idle; an open
   stream or a request in flight holds a session open). One node: pin a session to
   one process in a load balancer.
@@ -179,9 +180,9 @@ mcpd -http 127.0.0.1:8080                               # streamable HTTP at /mc
 - **Prefer a UID/GID allow-list** (`-allow-uid`/`-allow-gid`) — enforced from
   kernel `SO_PEERCRED`, unforgeable, and the *only* authentication on an abstract
   socket. Peer creds are **Linux-only**; off-Linux, credential-gated admission
-  fails closed and socket-file permissions apply. Note that `-max-conns-per-uid`
-  (default 8) is credential-gated too: on macOS and the BSDs `mcpd -socket …` with
-  default flags refuses every connection, so pass `-max-conns-per-uid 0` there.
+  fails closed and socket-file permissions apply. `-max-conns-per-uid`
+  (default 8) needs credentials to count, so on macOS and the BSDs it is not applied
+  and only `-max-conns` bounds connections.
 - **Least privilege** — run unprivileged (under a dedicated user, as the unit
   `build/mcp --server` installs does); the socket is created under a umask and never exists wider than `-mode`.
 - **Limits are on by default** — `-max-conns`, `-max-conns-per-uid`, idle/write

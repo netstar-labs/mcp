@@ -88,8 +88,9 @@ registry (tools / resources / prompts)  ──▶ handler ──▶ result ─�
   subscriptions, pending calls, per-UID connections. Hostile input is the design
   center, not an afterthought.
 - **Peer creds are Linux-only** — the honest platform boundary of a stdlib-only
-  build; off-Linux, admission that needs creds (an allow-list, or `MaxConnsPerUID`)
-  fails closed and socket-file permissions carry the access control.
+  build; off-Linux, admission that needs creds (an allow-list, or `RequirePeerCred`)
+  fails closed and socket-file permissions carry the access control; `MaxConnsPerUID`
+  is simply not counted there.
 - **stdio owns stdout** — nothing else in the process may write there; the logger
   defaults to stderr.
 - **HTTP is wire, not policy** — the handler does not authenticate. It takes the

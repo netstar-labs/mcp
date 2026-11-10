@@ -80,6 +80,9 @@ type Session struct {
 	sem      chan struct{}
 	queued   atomic.Int32
 	maxQueue int32
+	// queuedBytes is what the queued and running requests hold, against
+	// Options.MaxQueuedBytes.
+	queuedBytes atomic.Int64
 
 	mu         sync.Mutex
 	clientInfo Implementation
@@ -262,6 +265,10 @@ func (s *Session) handleFrame(ctx context.Context, frame []byte) {
 		s.sendError(nullLiteral, rerr)
 		return
 	}
+	if id, rerr := wm.checkVersion(); rerr != nil {
+		s.sendError(id, rerr)
+		return
+	}
 	s.route(ctx, &wm)
 }
 
@@ -307,6 +314,10 @@ func (s *Session) handleBatch(ctx context.Context, frame []byte) {
 			replies = append(replies, marshalError(nullLiteral, rerr))
 			continue
 		}
+		if id, rerr := wm.checkVersion(); rerr != nil {
+			replies = append(replies, marshalError(id, rerr))
+			continue
+		}
 		switch wm.kind() {
 		case kindRequest:
 			replies = append(replies, s.runRequestSync(ctx, &wm))
@@ -326,10 +337,6 @@ func (s *Session) handleBatch(ctx context.Context, frame []byte) {
 func (s *Session) route(ctx context.Context, wm *wireMessage) {
 	switch wm.kind() {
 	case kindRequest:
-		if wm.JSONRPC != JSONRPCVersion {
-			s.sendError(wm.ID, Errorf(CodeInvalidRequest, "unsupported jsonrpc version %q", wm.JSONRPC))
-			return
-		}
 		if wm.Method == MethodInitialize {
 			// Run the handshake inline. A conformant client waits for the
 			// initialize result before sending notifications/initialized, but
@@ -367,11 +374,21 @@ func (s *Session) spawnRequest(ctx context.Context, wm *wireMessage) {
 		s.sendError(wm.ID, Errorf(CodeInternalError, "server is overloaded; retry later"))
 		return
 	}
+	// Only the read loop admits, so the check-then-add below cannot race with
+	// another admission; completions only lower the total.
+	size := int64(len(wm.Method) + len(wm.ID) + len(wm.Params))
+	if held := s.queuedBytes.Load(); held > 0 && held+size > int64(s.server.opts.MaxQueuedBytes) {
+		s.queued.Add(-1)
+		s.sendError(wm.ID, Errorf(CodeInternalError, "server is overloaded; too many request bytes queued; retry later"))
+		return
+	}
+	s.queuedBytes.Add(size)
 	reqCtx, entry, release := s.registerInflight(ctx, wm)
 	s.work.Add(1)
 	go func() {
 		defer s.work.Done()
 		defer s.queued.Add(-1)
+		defer s.queuedBytes.Add(-size)
 		defer release()
 		if reply := s.runRegistered(reqCtx, wm, entry); reply != nil {
 			s.sendRaw(reply)
@@ -552,13 +569,55 @@ func marshalError(id json.RawMessage, e *RPCError) json.RawMessage {
 	return mustMarshal(outError{JSONRPC: JSONRPCVersion, ID: id, Error: e})
 }
 
-// Notify sends a notification to the client.
-func (s *Session) Notify(method string, params any) error {
+// encodeNotification builds the wire frame of a notification.
+func encodeNotification(method string, params any) ([]byte, error) {
 	encoded, err := encodeParams(params)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	frame, err := marshal(outNotification{JSONRPC: JSONRPCVersion, Method: method, Params: encoded})
+	return marshal(outNotification{JSONRPC: JSONRPCVersion, Method: method, Params: encoded})
+}
+
+var (
+	errSessionClosed = errors.New("mcp: session closed")
+	errQueueFull     = errors.New("mcp: session outbound queue is full")
+)
+
+// offer queues a frame without blocking: nil if queued, errQueueFull if the
+// queue has no room, errSessionClosed if the session is gone.
+func (s *Session) offer(frame []byte) error {
+	select {
+	case <-s.done:
+		return errSessionClosed
+	default:
+	}
+	select {
+	case s.out <- frame:
+		return nil
+	default:
+		return errQueueFull
+	}
+}
+
+// offerWithin waits up to grace for room in the queue and closes the session if
+// there is none: a peer that does not drain for that long has stopped reading.
+func (s *Session) offerWithin(frame []byte, grace time.Duration) error {
+	t := time.NewTimer(grace)
+	defer t.Stop()
+	select {
+	case s.out <- frame:
+		return nil
+	case <-s.done:
+		return errSessionClosed
+	case <-t.C:
+		_ = s.Close()
+		return fmt.Errorf("closed: not reading for %v", grace)
+	}
+}
+
+// Notify sends a notification to the client.
+func (s *Session) Notify(method string, params any) error {
+	frame, err := encodeNotification(method, params)
 	if err != nil {
 		return err
 	}
@@ -566,7 +625,7 @@ func (s *Session) Notify(method string, params any) error {
 	case s.out <- frame:
 		return nil
 	case <-s.done:
-		return errors.New("mcp: session closed")
+		return errSessionClosed
 	}
 }
 

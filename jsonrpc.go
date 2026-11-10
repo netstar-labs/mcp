@@ -124,6 +124,20 @@ func (m *wireMessage) validate() *RPCError {
 	return nil
 }
 
+// checkVersion rejects a message whose "jsonrpc" member is not "2.0", whatever
+// its kind. It returns the id the error reply carries: the request's own, so
+// the caller can match it, and null for everything else, which has none.
+func (m *wireMessage) checkVersion() (json.RawMessage, *RPCError) {
+	if m.JSONRPC == JSONRPCVersion {
+		return nil, nil
+	}
+	id := json.RawMessage(nullLiteral)
+	if m.kind() == kindRequest {
+		id = m.ID
+	}
+	return id, Errorf(CodeInvalidRequest, "unsupported jsonrpc version %q", m.JSONRPC)
+}
+
 var nullLiteral = []byte("null")
 
 // Outbound shapes. These are separate types so that required members are

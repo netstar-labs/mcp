@@ -40,14 +40,15 @@ Only the latest release is supported; versions are `v0.y.z`, and a fix ships as 
   that authenticates (a token check, mTLS, a gateway) and use `Identify` to bind sessions to the
   result. `mcpd -http` binds loopback unless `-http-any-iface` is given, for that reason.
 - **Rate limiting and abuse beyond the caps above.** There is no per-client request rate limit and
-  no per-address session limit; `MaxSessions` is global. Those belong to the layer in front.
+  no per-address session limit; `MaxSessions` is global, and `MaxSessionsPerIdentity` bounds only
+  an identity the wrapper supplied through `Identify`. Those belong to the layer in front.
 - **Transport confidentiality.** The HTTP handler speaks plain HTTP; terminate TLS in the
   `http.Server` or in front of it.
 - **A malicious tool handler.** Handlers run with the process's privileges. `ToolAnnotations` are
   server-supplied hints and are untrusted by construction; nothing here treats them as a control.
 - **Peer credentials off Linux.** On macOS and the BSDs UID/GID admission fails closed and
   socket-file permissions are the access control. The per-UID connection cap
-  (`MaxConnsPerUID`, `mcpd -max-conns-per-uid`, default 8 in mcpd) also needs credentials, so
-  there `mcpd -socket` refuses every connection unless `-max-conns-per-uid 0` is given.
+  (`MaxConnsPerUID`, `mcpd -max-conns-per-uid`, default 8 in mcpd) is not counted there, so only
+  the total cap (`MaxConns`) bounds connections.
 - **Resumption, replay and cross-node sessions.** A frame in flight when an HTTP stream drops is
   lost, and sessions live in one process's memory.

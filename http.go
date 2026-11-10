@@ -90,6 +90,13 @@ type HTTPOptions struct {
 	// Default DefaultHTTPMaxSessions.
 	MaxSessions int
 
+	// MaxSessionsPerIdentity bounds the live sessions one identity (as returned
+	// by Identify) may hold; initialize past it is answered 429. Zero means no
+	// per-identity bound. Sessions with an empty identity, which is every session
+	// when Identify is nil, are not counted: this bounds a caller the wrapper
+	// has told us about, so it needs Identify.
+	MaxSessionsPerIdentity int
+
 	// KeepAlive is the interval of SSE comments on an open stream, which keep
 	// proxies from closing it and detect a client that has gone. Negative
 	// disables. Default DefaultHTTPKeepAlive.
@@ -136,7 +143,7 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 	}
 	opts.AllowedOrigins = slices.Clone(opts.AllowedOrigins)
 	opts.AllowedHosts = slices.Clone(opts.AllowedHosts)
-	return &httpHandler{srv: s, opts: opts, sessions: make(map[string]*httpSession)}
+	return &httpHandler{srv: s, opts: opts, sessions: make(map[string]*httpSession), owned: make(map[string]int)}
 }
 
 type httpHandler struct {
@@ -145,6 +152,7 @@ type httpHandler struct {
 
 	mu       sync.Mutex
 	sessions map[string]*httpSession
+	owned    map[string]int // live sessions per identity; the empty identity is never counted
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -551,14 +559,24 @@ func (h *httpHandler) create(r *http.Request) (*httpSession, int) {
 	s.hs = time.AfterFunc(h.opts.HandshakeTimeout, s.handshakeExpired)
 
 	h.mu.Lock()
-	if len(h.sessions) >= h.opts.MaxSessions {
+	status := 0
+	switch {
+	case len(h.sessions) >= h.opts.MaxSessions:
+		status = http.StatusServiceUnavailable
+	case h.opts.MaxSessionsPerIdentity > 0 && h.owned[s.owner] >= h.opts.MaxSessionsPerIdentity:
+		status = http.StatusTooManyRequests
+	}
+	if status != 0 {
 		h.mu.Unlock()
 		s.idle.Stop()
 		s.hs.Stop()
 		cancel()
-		return nil, http.StatusServiceUnavailable
+		return nil, status
 	}
 	h.sessions[s.id] = s
+	if s.owner != "" {
+		h.owned[s.owner]++
+	}
 	h.mu.Unlock()
 
 	go func() {
@@ -766,6 +784,11 @@ func (s *httpSession) Close() error {
 		s.mu.Unlock()
 		s.h.mu.Lock()
 		delete(s.h.sessions, s.id)
+		if s.owner != "" {
+			if s.h.owned[s.owner]--; s.h.owned[s.owner] <= 0 {
+				delete(s.h.owned, s.owner)
+			}
+		}
 		s.h.mu.Unlock()
 	})
 	return nil
