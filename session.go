@@ -64,6 +64,7 @@ type Session struct {
 	framer Framer
 	remote string
 	peer   *PeerCred
+	ident  string
 
 	state atomic.Int32
 
@@ -102,6 +103,12 @@ func (s *Session) RemoteAddr() string { return s.remote }
 
 // Peer returns the peer's Unix credentials, or nil when unavailable.
 func (s *Session) Peer() *PeerCred { return s.peer }
+
+// Identity is the caller identity the transport's wrapper vouched for (see
+// HTTPOptions.Identify), or "" when none did. It is whatever the wrapper
+// returned, verbatim: this package does not authenticate, it only carries the
+// answer to the handlers that have to authorise by it.
+func (s *Session) Identity() string { return s.ident }
 
 // ClientInfo returns the implementation the client declared at initialize.
 func (s *Session) ClientInfo() Implementation {
@@ -155,6 +162,10 @@ type ConnConfig struct {
 	// Peer carries kernel-attested credentials, when available.
 	Peer *PeerCred
 
+	// Identity is a caller identity vouched for by something in front of this
+	// package, exposed to handlers as Session.Identity.
+	Identity string
+
 	// OnSession, if set, runs once with the new Session before the read loop
 	// starts. It is the hook transports use to arm a handshake timer.
 	OnSession func(*Session)
@@ -164,6 +175,7 @@ type ConnConfig struct {
 // disconnects, the context is cancelled, or a fatal framing error occurs.
 func (s *Server) ServeConn(ctx context.Context, f Framer, cfg ConnConfig) error {
 	sess := newSession(s, f, cfg.Remote, cfg.Peer)
+	sess.ident = cfg.Identity
 	if cfg.OnSession != nil {
 		cfg.OnSession(sess)
 	}

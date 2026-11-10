@@ -5,6 +5,11 @@
 //	mcpd -socket /run/mcpd/mcpd.sock -mode 0660 -group analysts
 //	mcpd -socket @mcpd -allow-uid 1000        # abstract namespace, uid-gated
 //	mcpd -stdio -socket /tmp/mcpd.sock        # both, sharing one registry
+//	mcpd -http 127.0.0.1:8080                 # streamable HTTP at /mcp, loopback only
+//
+// The HTTP transport has no authentication of its own. mcpd binds it to loopback
+// unless told otherwise; to serve it beyond the host, put something that
+// authenticates in front of it (see example/http).
 package main
 
 import (
@@ -45,11 +50,16 @@ func main() {
 		maxPerUID  = flag.Int("max-conns-per-uid", 8, "maximum concurrent connections from any one uid")
 		idleTO     = flag.Duration("idle-timeout", 10*time.Minute, "drop connections idle for this long (0 disables)")
 		writeTO    = flag.Duration("write-timeout", 30*time.Second, "bound on a single socket write (0 disables)")
+
+		httpAddr    = flag.String("http", "", "serve streamable HTTP at /mcp on this address (host:port); loopback only unless -http-any-iface")
+		httpOrigins = flag.String("http-origin", "", "comma-separated browser origins allowed to call the HTTP endpoint (default: none)")
+		httpHosts   = flag.String("http-host", "", "comma-separated Host header values accepted (recommended when binding loopback)")
+		httpAny     = flag.Bool("http-any-iface", false, "allow -http to bind a non-loopback address; the endpoint is unauthenticated, so something in front of it must authenticate")
 	)
 	flag.Parse()
 
-	if !*useStdio && *socketPath == "" {
-		fmt.Fprintln(os.Stderr, "mcpd: specify -stdio, -socket, or both")
+	if !*useStdio && *socketPath == "" && *httpAddr == "" {
+		fmt.Fprintln(os.Stderr, "mcpd: specify -stdio, -socket, -http, or a combination")
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -87,7 +97,7 @@ func main() {
 	defer stop()
 
 	var wg sync.WaitGroup
-	fail := make(chan error, 2)
+	fail := make(chan error, 3)
 
 	if *socketPath != "" {
 		opts, err := unixOptions(socketConfig{
@@ -109,6 +119,22 @@ func main() {
 			defer l.Close()
 			if err := srv.Serve(ctx, l, opts); err != nil {
 				fail <- fmt.Errorf("socket: %w", err)
+			}
+		}()
+	}
+
+	if *httpAddr != "" {
+		cfg := httpConfig{addr: *httpAddr, origins: splitCSV(*httpOrigins), hosts: splitCSV(*httpHosts), anyIface: *httpAny}
+		l, err := listenHTTP(cfg)
+		if err != nil {
+			logger.Fatalf("http: %v", err)
+		}
+		logger.Printf("listening on http://%s/mcp", l.Addr())
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := serveHTTP(ctx, srv, l, cfg, logger); err != nil {
+				fail <- fmt.Errorf("http: %w", err)
 			}
 		}()
 	}

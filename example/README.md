@@ -3,6 +3,7 @@
 | Example | What it shows | Run |
 |---|---|---|
 | [stdio](stdio/main.go) | a minimal MCP server — one `echo` tool — over the stdio transport | `go run ./example/stdio` |
+| [http](http/main.go) | a tool over streamable HTTP behind a bearer-token wrapper; shows `Identify` and `Session.Identity` | `MCP_TOKENS='s3cret:alice' go run ./example/http` |
 
 Build standalone with `GOWORK=off` (the module has no third-party requires).
 
@@ -15,8 +16,8 @@ stdout — the MCP stdio wire format:
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}
 ```
 
-The package is also an MCP **client** (`mcp.Dial` → `Initialize`/`ListTools`/
-`CallTool`) — no standalone client example lives here yet; see the
+The package is also an MCP **client** (`mcp.Dial` or `mcp.DialHTTP` → `Initialize`/
+`ListTools`/`CallTool`) — no standalone client example lives here yet; see the
 [user guide](../docs/userguide.md#client).
 
 For the reference daemon over a Unix socket (with peer-credential admission), see

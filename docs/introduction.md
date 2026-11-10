@@ -10,15 +10,15 @@ agent may touch, and answers safely — and now the **client** that knocks, too.
 
 `mcp` is a pure-Go, **standard-library-only** implementation of MCP — now **both
 ends, server and client**. The server is a
-JSON-RPC 2.0 engine speaking MCP over stdio, a Unix socket, or systemd-activated
-descriptors — one registry of tools/resources/prompts served across every
-transport at once. It negotiates all three protocol revisions (`2024-11-05`,
+JSON-RPC 2.0 engine speaking MCP over stdio, a Unix socket, systemd-activated
+descriptors, or streamable HTTP — one registry of tools/resources/prompts served
+across every transport at once. It negotiates all three protocol revisions (`2024-11-05`,
 `2025-03-26`, `2025-06-18`), and **derives its advertised capabilities from what is
 actually registered**, so the server can never claim a capability it doesn't
 implement. `go.mod` has no require block, and it stays that way — no code
 generation, no reflection tricks. The **client** (`Dial`) is the same engine turned
 around: it drives a tool server over any byte stream — a socket, a stdio pipe pair,
-an in-memory pipe — reusing the same Framer, JSON-RPC, and protocol types. One
+an in-memory pipe — or over HTTP, reusing the same Framer, JSON-RPC, and protocol types. One
 wire, two roles, and the require block stays empty on both.
 
 ## The capability nobody else brings here
@@ -39,17 +39,17 @@ The client role has a shipped consumer:
 [`mcpgw`](https://github.com/netstar-labs/mcpgw), the NetSTAR MCP edge. It serves
 agents over HTTP at the network boundary and reaches the local tool servers
 (`aegis-mcp`, the analyzers) through this package's `Client` — so the gateway
-carries edge policy (auth, gate, capture, quota) and none of the protocol. That is
+carries edge policy (auth, gate, capture, quota) and none of the protocol. A
+service that wants no gateway can now serve HTTP itself, from this package, behind
+whatever authenticates. That is
 the gateway pattern the client was added for, and it runs live: the aegis fan-out
 returns real DNS through `mcp.Client`.
 
 ## The scope it keeps
 
-It serves *and* consumes now, but deliberately not everything: the streamable-HTTP
-transport is **scoped** (design in the untracked `docs/plan/scope-http-transport.md`;
-`mcpgw` hand-rolls its own facade until it lands) but not yet built —
-server and client both speak stdio + Unix-socket framing today; no server-side
-JSON-Schema validation (handlers unmarshal into typed structs and return a tool
+It serves *and* consumes, but deliberately not everything: the HTTP transport is
+wire, not policy — it authenticates no one, resumes no stream, and shares no session
+across nodes; no server-side JSON-Schema validation (handlers unmarshal into typed structs and return a tool
 error on mismatch); URI templates are *matched*, not expanded; and the client is
 deliberately minimal — tools, not resources/prompts/sampling. What it does, it does
 to the letter of the spec and the limits of the hostile-input threat model.

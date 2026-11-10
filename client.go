@@ -4,9 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"slices"
 	"strconv"
 	"sync"
+)
+
+// Client limits. Both bound something the peer controls.
+const (
+	// maxClientServerRequests bounds server→client requests being handled at
+	// once; a server that floods elicitations is answered "overloaded" rather
+	// than getting a goroutine each.
+	maxClientServerRequests = 64
+
+	// maxListPages bounds how many pages ListTools follows, so a server that
+	// never stops returning a cursor cannot hold the client forever.
+	maxListPages = 1000
 )
 
 // Client is a minimal MCP client over a Framer. It performs the initialize
@@ -16,9 +31,9 @@ import (
 // public method is safe for concurrent use.
 //
 // It is deliberately small — enough for a consumer (a gateway, a tool that
-// composes another) to drive a local tool server, not a feature-complete client.
-// Resources, prompts, sampling, and pagination past the first page are out of
-// scope; add them when a consumer needs them.
+// composes another) to drive a tool server, not a feature-complete client.
+// Resources, prompts, sampling, and server notifications are out of scope; add
+// them when a consumer needs them.
 type Client struct {
 	fr    Framer
 	info  Implementation
@@ -26,11 +41,16 @@ type Client struct {
 
 	writeMu sync.Mutex // serialises WriteMessage across callers and the reader's responses
 
-	mu      sync.Mutex
-	nextID  int64
-	pending map[string]chan wireMessage
-	closed  bool
-	err     error // terminal read error
+	mu       sync.Mutex
+	nextID   int64
+	pending  map[string]chan wireMessage
+	handling map[string]context.CancelFunc // server→client requests being handled, by id key
+	closed   bool
+	err      error // terminal read error
+
+	ctx    context.Context // cancelled when the connection ends; the parent of every handler's context
+	cancel context.CancelFunc
+	sem    chan struct{} // bounds concurrent server→client request handlers
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -48,6 +68,13 @@ type ClientOptions struct {
 	Framing         FramingMode          // defaults to FramingLines (MCP stdio / socket)
 	MaxMessageBytes int                  // zero selects DefaultMaxMessageBytes
 	OnRequest       ServerRequestHandler // handles server→client requests; nil ⇒ method-not-found, and the elicitation capability is not advertised
+
+	// HTTPClient and Header apply to DialHTTP only. HTTPClient carries the TLS
+	// configuration, proxy and RoundTripper (nil selects a client with no
+	// timeout, which a stream needs); Header is sent on every request, which is
+	// where a bearer token goes. Framing is ignored by DialHTTP.
+	HTTPClient *http.Client
+	Header     http.Header
 }
 
 // Dial starts a client over rwc — a socket, a stdio pipe pair, or an in-memory
@@ -59,13 +86,22 @@ func Dial(rwc io.ReadWriteCloser, opts ClientOptions) *Client {
 		MaxMessageBytes: opts.MaxMessageBytes,
 		Closer:          rwc,
 	})
+	return newClient(fr, opts)
+}
+
+// newClient builds a Client over any Framer and starts its read loop. Dial and
+// DialHTTP differ only in the Framer.
+func newClient(fr Framer, opts ClientOptions) *Client {
 	c := &Client{
-		fr:      fr,
-		info:    opts.Info,
-		onReq:   opts.OnRequest,
-		pending: make(map[string]chan wireMessage),
-		done:    make(chan struct{}),
+		fr:       fr,
+		info:     opts.Info,
+		onReq:    opts.OnRequest,
+		pending:  make(map[string]chan wireMessage),
+		handling: make(map[string]context.CancelFunc),
+		sem:      make(chan struct{}, maxClientServerRequests),
+		done:     make(chan struct{}),
 	}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
 	go c.readLoop()
 	return c
 }
@@ -94,21 +130,43 @@ func (c *Client) Initialize(ctx context.Context) (InitializeResult, error) {
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return res, err
 	}
-	_ = c.notify(NotifyInitialized, nil)
+	if !slices.Contains(DefaultProtocolVersions, res.ProtocolVersion) {
+		return res, fmt.Errorf("mcp: server chose protocol version %q, which this client does not speak", sanitize(res.ProtocolVersion))
+	}
+	if err := c.notify(NotifyInitialized, nil); err != nil {
+		return res, err
+	}
 	return res, nil
 }
 
-// ListTools returns the server's first page of tools.
+// ListTools returns every tool the server lists, following nextCursor across
+// pages. A server that repeats a cursor, or never stops paging, is an error.
 func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
-	raw, err := c.call(ctx, MethodToolsList, PaginatedParams{})
-	if err != nil {
-		return nil, err
+	var (
+		tools  []Tool
+		cursor string
+		seen   = map[string]struct{}{}
+	)
+	for range maxListPages {
+		raw, err := c.call(ctx, MethodToolsList, PaginatedParams{Cursor: cursor})
+		if err != nil {
+			return nil, err
+		}
+		var res ListToolsResult
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return nil, err
+		}
+		tools = append(tools, res.Tools...)
+		if res.NextCursor == "" {
+			return tools, nil
+		}
+		if _, dup := seen[res.NextCursor]; dup {
+			return nil, errors.New("mcp: server repeated a pagination cursor")
+		}
+		seen[res.NextCursor] = struct{}{}
+		cursor = res.NextCursor
 	}
-	var res ListToolsResult
-	if err := json.Unmarshal(raw, &res); err != nil {
-		return nil, err
-	}
-	return res.Tools, nil
+	return nil, fmt.Errorf("mcp: server returned more than %d pages of tools", maxListPages)
 }
 
 // CallTool invokes name with args. A JSON-RPC error (unknown tool, malformed
@@ -139,6 +197,7 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
+	c.cancel()          // handlers still running see their context end
 	return c.fr.Close() // unblocks the read loop, which closes c.done
 }
 
@@ -152,7 +211,13 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 
 	c.mu.Lock()
 	if c.closed {
+		// A connection that ended for a reason says so; only a plain Close, or a
+		// clean EOF, is "closed".
+		cause := c.err
 		c.mu.Unlock()
+		if cause != nil && !errors.Is(cause, io.EOF) {
+			return nil, cause
+		}
 		return nil, errors.New("mcp: client closed")
 	}
 	c.nextID++
@@ -183,6 +248,13 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 		}
 		return m.Result, nil
 	case <-ctx.Done():
+		// Tell the server to stop working on it (utilities/cancellation), except
+		// for initialize, which the spec forbids cancelling. Best effort, and off
+		// this goroutine: a peer that has stopped reading would otherwise make a
+		// cancelled call outlive its own context. The write ends when Close does.
+		if method != MethodInitialize {
+			go func() { _ = c.notify(NotifyCancelled, CancelledParams{RequestID: idRaw, Reason: ctx.Err().Error()}) }()
+		}
 		return nil, ctx.Err()
 	case <-c.done:
 		return nil, c.readErr()
@@ -222,9 +294,13 @@ func (c *Client) readLoop() {
 		case kindResponse:
 			c.deliver(m)
 		case kindRequest:
-			c.handleServerRequest(m)
+			c.dispatchServerRequest(m)
+		case kindNotification:
+			if m.Method == NotifyCancelled {
+				c.cancelServerRequest(m.Params)
+			}
 		default:
-			// notification / invalid — nothing to correlate
+			// invalid — nothing to correlate
 		}
 	}
 }
@@ -242,29 +318,74 @@ func (c *Client) deliver(m wireMessage) {
 	}
 }
 
-func (c *Client) handleServerRequest(m wireMessage) {
-	var (
-		result any
-		rerr   *RPCError
-	)
-	if c.onReq != nil {
-		result, rerr = c.onReq(context.Background(), m.Method, m.Params)
-	} else {
-		rerr = Errorf(CodeMethodNotFound, "no handler for %s", sanitize(m.Method))
+// dispatchServerRequest answers a server→client request off the read loop. A
+// handler may block for as long as a human takes to answer an elicitation, and
+// may call back into the Client; run inline, either would stall the loop that
+// delivers the replies they wait for.
+func (c *Client) dispatchServerRequest(m wireMessage) {
+	if m.Method == MethodPing {
+		c.respond(m.ID, struct{}{}, nil) // ping is answered by every peer, handler or not
+		return
 	}
+	if c.onReq == nil {
+		c.respond(m.ID, nil, Errorf(CodeMethodNotFound, "no handler for %s", sanitize(m.Method)))
+		return
+	}
+	select {
+	case c.sem <- struct{}{}:
+	default:
+		c.respond(m.ID, nil, Errorf(CodeInternalError, "client is overloaded; retry later"))
+		return
+	}
+	ctx, cancel := context.WithCancel(c.ctx)
+	key := idKey(m.ID)
+	c.mu.Lock()
+	c.handling[key] = cancel
+	c.mu.Unlock()
+	go func() {
+		defer func() { <-c.sem }()
+		result, rerr := c.onReq(ctx, m.Method, m.Params)
+		c.mu.Lock()
+		delete(c.handling, key)
+		c.mu.Unlock()
+		cancelled := ctx.Err() != nil
+		cancel()
+		if cancelled {
+			return // the server cancelled it, or the connection ended: no reply is expected
+		}
+		c.respond(m.ID, result, rerr)
+	}()
+}
+
+// cancelServerRequest ends the handler of a request the server cancelled.
+func (c *Client) cancelServerRequest(params json.RawMessage) {
+	var p CancelledParams
+	if json.Unmarshal(params, &p) != nil || len(p.RequestID) == 0 {
+		return
+	}
+	c.mu.Lock()
+	cancel := c.handling[idKey(p.RequestID)]
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// respond writes the reply to a server→client request.
+func (c *Client) respond(id json.RawMessage, result any, rerr *RPCError) {
 	if rerr != nil {
-		if raw, err := marshal(outError{JSONRPC: JSONRPCVersion, ID: m.ID, Error: rerr}); err == nil {
+		if raw, err := marshal(outError{JSONRPC: JSONRPCVersion, ID: id, Error: rerr}); err == nil {
 			_ = c.write(raw)
 		}
 		return
 	}
 	rb, err := marshal(result)
 	if err != nil {
-		eb, _ := marshal(outError{JSONRPC: JSONRPCVersion, ID: m.ID, Error: Errorf(CodeInternalError, "encode result: %v", err)})
+		eb, _ := marshal(outError{JSONRPC: JSONRPCVersion, ID: id, Error: Errorf(CodeInternalError, "encode result: %v", err)})
 		_ = c.write(eb)
 		return
 	}
-	if raw, err := marshal(outResponse{JSONRPC: JSONRPCVersion, ID: m.ID, Result: rb}); err == nil {
+	if raw, err := marshal(outResponse{JSONRPC: JSONRPCVersion, ID: id, Result: rb}); err == nil {
 		_ = c.write(raw)
 	}
 }
@@ -276,6 +397,7 @@ func (c *Client) fail(err error) {
 	}
 	c.closed = true
 	c.mu.Unlock()
+	c.cancel()
 	c.doneOnce.Do(func() { close(c.done) })
 }
 

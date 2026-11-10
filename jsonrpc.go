@@ -28,6 +28,10 @@ const (
 	CodeRequestTooLarge  = -32003
 	CodeResourceNotFound = -32004 // used by resources/read per MCP convention
 	CodeResourceLimit    = -32005 // a per-session quota was exhausted
+
+	// CodeRequestCancelled is the code a transport answers with for a request
+	// the peer cancelled before it completed (the LSP value, which MCP follows).
+	CodeRequestCancelled = -32800
 )
 
 // Structural limits applied to every inbound message. These are deliberately
