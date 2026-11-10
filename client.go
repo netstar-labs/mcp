@@ -10,7 +10,12 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 )
+
+// cancelWriteTimeout bounds how long the notification that cancels an abandoned call
+// may wait for the write lock; a variable so a test can shorten it.
+var cancelWriteTimeout = 5 * time.Second
 
 // Client limits. Both bound something the peer controls.
 const (
@@ -25,7 +30,8 @@ const (
 
 	// maxListBytes bounds what ListTools retains across pages. A page is already
 	// capped at MaxMessageBytes; without this a hostile server could still make
-	// the client hold a thousand of them.
+	// the client hold a thousand of them. (A client that raises MaxMessageBytes
+	// above this trips it on a single page.)
 	maxListBytes = 32 << 20
 )
 
@@ -45,7 +51,7 @@ type Client struct {
 	info  Implementation
 	onReq ServerRequestHandler
 
-	writeMu sync.Mutex // serialises WriteMessage across callers and the reader's responses
+	wsem chan struct{} // capacity 1: serialises WriteMessage across callers and the reader's responses; a channel so a waiter can give up
 
 	mu       sync.Mutex
 	nextID   int64
@@ -102,6 +108,7 @@ func newClient(fr Framer, opts ClientOptions) *Client {
 		fr:       fr,
 		info:     opts.Info,
 		onReq:    opts.OnRequest,
+		wsem:     make(chan struct{}, 1),
 		pending:  make(map[string]chan wireMessage),
 		handling: make(map[string]context.CancelFunc),
 		sem:      make(chan struct{}, maxClientServerRequests),
@@ -274,16 +281,29 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 // cancelRemote tells the server to stop working on a request the caller has given
 // up on (utilities/cancellation), except for initialize, which the spec forbids
 // cancelling. Best effort, and off this goroutine: a peer that has stopped reading
-// would otherwise make a cancelled call outlive its own context. The write ends when
-// Close does.
+// would otherwise make a cancelled call outlive its own context, and bounded by
+// cancelWriteTimeout so a stalled peer does not collect a goroutine per cancelled call.
 func (c *Client) cancelRemote(method string, id json.RawMessage, why error) {
 	if method == MethodInitialize {
 		return
 	}
-	go func() { _ = c.notify(NotifyCancelled, CancelledParams{RequestID: id, Reason: why.Error()}) }()
+	// A framer that holds resources per request (the HTTP client's open POST) is told
+	// first, synchronously, so that freeing them does not wait for the notification.
+	if a, ok := c.fr.(interface{ abortRequest(json.RawMessage) }); ok {
+		a.abortRequest(id)
+	}
+	d := cancelWriteTimeout // read here, not in the goroutine: a test shortens it
+	go func() {
+		_ = c.notifyWithin(d, NotifyCancelled, CancelledParams{RequestID: id, Reason: why.Error()})
+	}()
 }
 
 func (c *Client) notify(method string, params any) error {
+	return c.notifyWithin(notifyTimeout, method, params)
+}
+
+// notifyWithin is notify with its own bound on waiting for the write.
+func (c *Client) notifyWithin(d time.Duration, method string, params any) error {
 	pb, err := encodeParams(params)
 	if err != nil {
 		return err
@@ -292,25 +312,37 @@ func (c *Client) notify(method string, params any) error {
 	if err != nil {
 		return err
 	}
-	return c.write(raw)
+	ctx, cancel := context.WithTimeout(c.ctx, d)
+	defer cancel()
+	return c.writeCtx(ctx, raw)
 }
 
-// writeCtx writes a request without letting the caller's deadline depend on the
-// peer. A write to a peer that has stopped reading blocks, and so does waiting for
-// the write lock behind another such write; neither may outlive the call that is
-// waiting. The write itself is not aborted once it has begun (that would leave half
-// a frame on the wire), only abandoned by the caller; a write still queued for the
-// lock when its call has given up is skipped, so a stall clearing does not release a
-// burst of requests nobody is waiting for.
+// writeCtx writes a frame without letting the caller's deadline depend on the peer.
+// A write to a peer that has stopped reading blocks, and so does waiting for the
+// write lock behind another such write; neither may outlive the call that is waiting.
+// The caller waits for the lock with its own context, in its own goroutine, so a
+// call that gives up leaves nothing behind. The write itself runs on one goroutine
+// that holds the lock until WriteMessage returns (it is not aborted once begun:
+// that would leave half a frame on the wire), and the caller stops waiting for it
+// when its context ends. Only that one stalled write outlives its caller, and it ends
+// when the stall clears or Close closes the connection. A caller whose context ended
+// while it was acquiring the lock never writes, so a stall clearing does not release
+// a burst of requests nobody is waiting for.
 func (c *Client) writeCtx(ctx context.Context, raw []byte) error {
+	select {
+	case c.wsem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return c.readErr()
+	}
+	if err := ctx.Err(); err != nil {
+		<-c.wsem
+		return err
+	}
 	res := make(chan error, 1)
 	go func() {
-		c.writeMu.Lock()
-		defer c.writeMu.Unlock()
-		if err := ctx.Err(); err != nil {
-			res <- err
-			return
-		}
+		defer func() { <-c.wsem }()
 		res <- c.fr.WriteMessage(raw)
 	}()
 	select {
@@ -323,10 +355,12 @@ func (c *Client) writeCtx(ctx context.Context, raw []byte) error {
 	}
 }
 
+// write writes a frame that no caller's context governs (a reply to a server request),
+// bounded so a stalled peer cannot hold it forever.
 func (c *Client) write(raw []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.fr.WriteMessage(raw)
+	ctx, cancel := context.WithTimeout(c.ctx, notifyTimeout)
+	defer cancel()
+	return c.writeCtx(ctx, raw)
 }
 
 func (c *Client) readLoop() {

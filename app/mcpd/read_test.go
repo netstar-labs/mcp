@@ -50,3 +50,25 @@ func TestReadRegularRefusesAFIFOWithoutBlocking(t *testing.T) {
 		t.Fatal("reading a FIFO under the root blocked")
 	}
 }
+
+// The read itself is bounded, not just the check after it: a file that grows while
+// read, or a /proc file that reports size 0, must not be read to the end.
+func TestReadBoundedStopsAtTheLimit(t *testing.T) {
+	endless := &countingReader{}
+	if _, err := readBounded(endless); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("err = %v, want the limit named", err)
+	}
+	if endless.n > maxReadFileBytes+4096 {
+		t.Fatalf("read %d bytes from an endless source; the read must stop at the limit", endless.n)
+	}
+}
+
+type countingReader struct{ n int }
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	r.n += len(p)
+	return len(p), nil
+}

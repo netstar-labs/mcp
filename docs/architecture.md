@@ -123,7 +123,10 @@ transport:
 - **Cancellation is two different things.** `notifications/cancelled` ends the
   POST of the request it names (the Session suppresses that reply, so nothing else
   would end it). A dropped connection is *not* a cancellation: the request keeps
-  running and its response is discarded.
+  running and its response is discarded when it arrives. Its id stays reserved
+  (the waiter is marked abandoned, and nothing is routed to it) until the Session
+  answers it or the client cancels it, so a retry that reuses the id is answered
+  400 rather than handed the first call's reply.
 - **Lifecycle.** A session id is minted at `initialize` (128 random bits) and
   returned only with a successful handshake. Sessions are capped, expire on a short
   handshake timer and then an idle TTL (an open stream or in-flight request holds

@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -363,4 +365,195 @@ func TestHTTPIDStaysReservedAfterItsPostDrops(t *testing.T) {
 		_ = readBody(t, r)
 		return r.StatusCode == http.StatusOK
 	})
+}
+
+// A1 C-3 (fix-skeptic): calls that give up against a stalled peer must not leave a
+// goroutine each behind. The one write already in progress holds its goroutine until
+// the stall clears or the client closes; nothing else may.
+func TestClientCallsGivingUpDoNotAccumulateGoroutines(t *testing.T) {
+	old := cancelWriteTimeout
+	cancelWriteTimeout = 200 * time.Millisecond
+	defer func() { cancelWriteTimeout = old }()
+
+	a, b := net.Pipe()
+	defer b.Close() // never read
+	c := Dial(a, ClientOptions{})
+	defer c.Close()
+	base := runtime.NumGoroutine()
+	var wg sync.WaitGroup
+	for range 100 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			_, _ = c.CallTool(ctx, "x", map[string]any{"pad": strings.Repeat("y", 1<<16)})
+		}()
+	}
+	wg.Wait()
+	eventually(t, "the calls' goroutines to end while the peer stays stalled", func() bool {
+		return runtime.NumGoroutine() <= base+8
+	})
+}
+
+// ...and once the stall clears only the request that was already being written, and
+// its cancellation, reach the peer: a request whose caller gave up is never sent.
+func TestClientDoesNotSendRequestsItsCallersGaveUpOn(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	c := Dial(a, ClientOptions{})
+	defer c.Close()
+	var wg sync.WaitGroup
+	for i := range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			_, _ = c.CallTool(ctx, fmt.Sprintf("call%d", i), map[string]any{"pad": strings.Repeat("y", 1<<16)})
+		}()
+		time.Sleep(5 * time.Millisecond)
+	}
+	wg.Wait() // every caller has given up; the peer has read nothing
+
+	fr := NewFramer(b, b, FramerOptions{Closer: b})
+	calls := map[string]bool{}
+	for {
+		_ = b.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
+		raw, err := fr.ReadMessage()
+		if err != nil {
+			break
+		}
+		var m wireMessage
+		_ = json.Unmarshal(raw, &m)
+		if m.Method == MethodToolsCall {
+			var p CallToolParams
+			_ = json.Unmarshal(m.Params, &p)
+			calls[p.Name] = true
+		}
+	}
+	if len(calls) > 1 {
+		t.Fatalf("%d requests reached the peer after their callers gave up: %v; only the one already mid-write may", len(calls), calls)
+	}
+}
+
+// A1 C-4 (fix-skeptic): the abort of a cancelled call's POST must not depend on the
+// cancel notification getting through. A server that stalls the notification as well
+// as the request must not keep the slots.
+func TestHTTPClientAbortsCancelledCallsEvenIfTheServerStallsTheCancel(t *testing.T) {
+	fx := newHTTPFixture(t, HTTPOptions{})
+	var cancels atomic.Int64
+	ts := front(t, fx, func(w http.ResponseWriter, r *http.Request, m wireMessage) bool {
+		if m.Method != MethodToolsCall && m.Method != NotifyCancelled {
+			return false
+		}
+		if m.Method == NotifyCancelled {
+			cancels.Add(1)
+		}
+		<-r.Context().Done() // stalls the request and its cancellation alike
+		return true
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	c, err := DialHTTP(ctx, ts.URL, ClientOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Initialize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range maxHTTPClientExchanges + 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cc, stop := context.WithTimeout(ctx, 50*time.Millisecond)
+			defer stop()
+			_, _ = c.CallTool(cc, "echo", nil)
+		}()
+	}
+	wg.Wait()
+	// Let every queued cancellation reach the server, where it stalls: each holds one
+	// of the cancellation slots (a handful), never a request slot.
+	last, stable := int64(-1), 0
+	for deadline := time.Now().Add(5 * time.Second); stable < 6 && time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if n := cancels.Load(); n == last {
+			stable++
+		} else {
+			last, stable = n, 0
+		}
+	}
+	if last > maxHTTPClientCancels {
+		t.Fatalf("%d cancellations were in flight at once; the budget is %d", last, maxHTTPClientCancels)
+	}
+	// Every call has given up: their request POSTs were aborted at once, not when the
+	// stalled cancellations time out, so a new request goes through.
+	cc, stop := context.WithTimeout(ctx, 3*time.Second)
+	defer stop()
+	if _, err := c.ListTools(cc); err != nil {
+		t.Fatalf("ListTools after the stalled cancels = %v", err)
+	}
+}
+
+// A1 C-6 (fix-skeptic): the spec says a notification is answered 202, but a lenient
+// server that answers 200 or 201 with an empty body has accepted it.
+func TestHTTPClientAcceptsAnyEmpty2xxForANotification(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusCreated, http.StatusNoContent} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			fx := newHTTPFixture(t, HTTPOptions{})
+			ts := front(t, fx, func(w http.ResponseWriter, r *http.Request, m wireMessage) bool {
+				if m.Method != NotifyInitialized {
+					return false
+				}
+				w.WriteHeader(status)
+				return true
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			c, err := DialHTTP(ctx, ts.URL, ClientOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			if _, err := c.Initialize(ctx); err != nil {
+				t.Fatalf("Initialize = %v after the server answered the notification %d", err, status)
+			}
+		})
+	}
+}
+
+// A1 C-11 (fix-skeptic): a redirect on the GET stream ends the stream loop rather than
+// retrying the same URL forever with backoff.
+func TestHTTPClientStreamLoopStopsOnARedirect(t *testing.T) {
+	fx := newHTTPFixture(t, HTTPOptions{})
+	var mu sync.Mutex
+	gets := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			mu.Lock()
+			gets++
+			mu.Unlock()
+			http.Redirect(w, r, "/elsewhere", http.StatusTemporaryRedirect)
+			return
+		}
+		fx.h.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := DialHTTP(ctx, ts.URL, ClientOptions{OnRequest: func(context.Context, string, json.RawMessage) (any, *RPCError) { return struct{}{}, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Initialize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1600 * time.Millisecond) // past the first retry backoff
+	mu.Lock()
+	defer mu.Unlock()
+	if gets != 1 {
+		t.Fatalf("the stream loop made %d GETs against a redirect; it should stop after the first", gets)
+	}
 }

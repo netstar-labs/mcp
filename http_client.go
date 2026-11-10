@@ -24,9 +24,13 @@ var ErrSessionExpired = errors.New("mcp: server no longer knows this session")
 var errHTTPBusy = errors.New("mcp: too many requests in flight to this server")
 
 const (
-	// maxHTTPClientExchanges bounds requests in flight from one client. Past it
-	// the writer waits, which is the back-pressure a caller sees as a slow call.
+	// maxHTTPClientExchanges bounds requests in flight from one client. Past it a
+	// request is refused at once (errHTTPBusy), and a notification waits up to
+	// notifyTimeout for a slot.
 	maxHTTPClientExchanges = 64
+
+	// maxHTTPClientCancels bounds cancellation POSTs in flight; one past it is dropped.
+	maxHTTPClientCancels = 8
 
 	httpClientQueue = 64
 
@@ -85,6 +89,7 @@ func DialHTTP(ctx context.Context, endpoint string, opts ClientOptions) (*Client
 		cancel:     cancel,
 		in:         make(chan []byte, httpClientQueue),
 		sem:        make(chan struct{}, maxHTTPClientExchanges),
+		csem:       make(chan struct{}, maxHTTPClientCancels),
 		calls:      make(map[string]context.CancelFunc),
 	}
 	return newClient(f, opts), nil
@@ -96,8 +101,8 @@ func DialHTTP(ctx context.Context, endpoint string, opts ClientOptions) (*Client
 // concurrent call. So a request is sent on its own goroutine, and whatever comes
 // back (a JSON body, or the frames of an SSE stream) is queued for ReadMessage.
 //
-// A notification or a reply is the opposite: it is sent before WriteMessage
-// returns. Separate HTTP requests have no order, and the one that matters is
+// A notification or a reply (other than a cancellation) is the opposite: it is sent
+// before WriteMessage returns. Separate HTTP requests have no order, and the one that matters is
 // notifications/initialized, which must reach the server before the request the
 // client sends next. The server acknowledges these with a bare 202, so the wait
 // is short.
@@ -112,6 +117,7 @@ type httpClientFramer struct {
 	cancel context.CancelFunc
 	in     chan []byte
 	sem    chan struct{}
+	csem   chan struct{} // slots for cancellation POSTs, apart from sem so stalled cancels cannot starve requests
 	wg     sync.WaitGroup
 
 	mu       sync.Mutex
@@ -152,22 +158,34 @@ func (f *httpClientFramer) WriteMessage(p []byte) error {
 	if kind == kindInvalid {
 		return errors.New("mcp: not a JSON-RPC request, notification or response")
 	}
-	if kind == kindNotification && m.Method == NotifyCancelled {
-		f.abortCall(m.Params) // frees the slot whether or not the server honours the cancel
+	// A request, and a cancellation, return at once and run on their own goroutine. A
+	// cancellation is best effort and needs no order with what follows it (only
+	// notifications/initialized does), so it must not hold the client's write lock
+	// while a stalled server sits on its POST.
+	cancellation := kind == kindNotification && m.Method == NotifyCancelled
+	async := kind == kindRequest || cancellation
+	within := notifyTimeout
+	if cancellation {
+		within = cancelWriteTimeout
 	}
-	if kind == kindRequest {
-		// A request never waits for a slot: past the limit the caller is told now,
-		// not left behind a stalled server it cannot see.
+	sem := f.sem
+	if cancellation {
+		sem = f.csem
+	}
+	if async {
+		// Never waits for a slot: past the limit a request is refused now, not left
+		// behind a stalled server it cannot see, and a cancellation is dropped (the
+		// request's POST has already been aborted by the Client).
 		select {
-		case f.sem <- struct{}{}:
+		case sem <- struct{}{}:
 		default:
 			return errHTTPBusy
 		}
 	} else {
-		t := time.NewTimer(notifyTimeout)
+		t := time.NewTimer(within)
 		defer t.Stop()
 		select {
-		case f.sem <- struct{}{}:
+		case sem <- struct{}{}:
 		case <-t.C:
 			return errHTTPBusy
 		case <-f.ctx.Done():
@@ -179,7 +197,7 @@ func (f *httpClientFramer) WriteMessage(p []byte) error {
 	f.mu.Lock()
 	if f.closed || f.ctx.Err() != nil { // no new work once Close has begun, so wg.Wait cannot race an Add
 		f.mu.Unlock()
-		<-f.sem
+		<-sem
 		return net.ErrClosed
 	}
 	var (
@@ -193,16 +211,16 @@ func (f *httpClientFramer) WriteMessage(p []byte) error {
 		ctx, cancel = context.WithCancel(f.ctx)
 		f.calls[idKey(m.ID)] = cancel
 	} else {
-		// The caller is waiting on this, holding the client's write lock: bound
-		// it, so a server that never answers cannot freeze every later write.
-		ctx, cancel = context.WithTimeout(f.ctx, notifyTimeout)
+		// Bounded, so a server that never answers cannot hold a slot (or, for the
+		// synchronous kinds, every later write) forever.
+		ctx, cancel = context.WithTimeout(f.ctx, within)
 	}
 	f.wg.Add(1)
 	f.mu.Unlock()
 
 	run := func() error {
 		defer f.wg.Done()
-		defer func() { <-f.sem }()
+		defer func() { <-sem }()
 		defer cancel()
 		if kind == kindRequest {
 			defer func() {
@@ -213,23 +231,20 @@ func (f *httpClientFramer) WriteMessage(p []byte) error {
 		}
 		return f.exchange(ctx, kind, m.ID, m.Method, body)
 	}
-	if kind == kindRequest {
+	if async {
 		go func() { _ = run() }()
 		return nil
 	}
 	return run()
 }
 
-// abortCall ends the POST of a request the caller has cancelled. The caller is no
-// longer listening, and the exchange would otherwise hold its slot for as long as
-// the server cares to keep the POST open.
-func (f *httpClientFramer) abortCall(params json.RawMessage) {
-	var p CancelledParams
-	if json.Unmarshal(params, &p) != nil || len(p.RequestID) == 0 {
-		return
-	}
+// abortRequest ends the POST of a request the caller has cancelled. The caller is no
+// longer listening, and the exchange would otherwise hold its slot for as long as the
+// server cares to keep the POST open. The Client calls it before it queues the
+// cancellation, so it does not depend on that notification getting through.
+func (f *httpClientFramer) abortRequest(id json.RawMessage) {
 	f.mu.Lock()
-	cancel := f.calls[idKey(p.RequestID)]
+	cancel := f.calls[idKey(id)]
 	f.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -357,6 +372,9 @@ func (f *httpClientFramer) exchange(ctx context.Context, kind msgKind, id json.R
 		if kind == kindRequest {
 			return f.failRequest(kind, id, fmt.Errorf("server answered %d to a request", resp.StatusCode))
 		}
+	case kind != kindRequest && resp.Header.Get("Content-Type") == "":
+		// The spec says 202, but a server that answers a notification 200 or 201 with
+		// no body has accepted it.
 	case isMediaType(resp.Header.Get("Content-Type"), "text/event-stream"):
 		f.readStream(resp.Body, kind, id)
 	case isMediaType(resp.Header.Get("Content-Type"), "application/json"):
@@ -489,9 +507,9 @@ func (f *httpClientFramer) getLoop() {
 			case code == http.StatusOK && isMediaType(resp.Header.Get("Content-Type"), "text/event-stream"):
 				backoff = time.Second
 				f.readStream(resp.Body, kindNotification, nil)
-			case code >= 400 && code < 500:
+			case code >= 300 && code < 500:
 				_ = resp.Body.Close()
-				return // 405: no stream offered; 401/403/406: retrying will not help
+				return // 405: no stream offered; 3xx (no redirects are followed), 401/403/406: retrying will not help
 			}
 			_ = resp.Body.Close()
 		}

@@ -105,8 +105,8 @@ not call it: it binds its own `-socket`.)
 
 **Streamable HTTP** — `Server.HTTPHandler(HTTPOptions)` returns an `http.Handler`
 (the transport as defined from revision 2025-03-26; the Server's usual version
-negotiation applies, so a 2024-11-05 client is also served over it): `POST` carries client→server messages,
-the reply is one JSON body or, when the server has something to say first (an
+negotiation applies, so a 2024-11-05 client is also served over it). `POST` carries
+client→server messages; the reply is one JSON body or, when the server has something to say first (an
 elicitation, a progress notification), an SSE stream; `GET` opens a stream for
 server-initiated messages; `DELETE` ends the session. It reuses the Session
 unchanged — each HTTP session is a `Framer` that queues POST bodies for the
@@ -174,7 +174,8 @@ longer knows the session ends the client with `ErrSessionExpired`: dial again.
   and header line length all have ceilings. A handler panic costs one request,
   and its stack trace is truncated before it reaches the log.
 - **Deadlines sit below the framer.** `IdleTimeout` drops a silent peer;
-  `HandshakeTimeout` drops one that connects and never initialises;
+  `HandshakeTimeout` (a timer, not a read deadline: a Ready session that is merely
+  quiet is not affected) drops one that connects and never initialises;
   `WriteTimeout` drops one that stops reading — without it a client can stall
   the session writer and back-pressure every handler behind it.
 - **`MaxConnsPerUID`** stops one local account from consuming the whole
@@ -298,8 +299,10 @@ silently loses its answers.
   [`mcpgw`](https://github.com/netstar-labs/mcpgw). The protocol's own OAuth
   resource-server metadata is not served.
 - **Stream resumption.** `Last-Event-ID` is ignored and a frame in flight when an
-  SSE stream drops is lost; a dropped POST stream is not a cancellation, and the
-  request's response is discarded when it arrives.
+  SSE stream drops is lost; a dropped POST stream is not a cancellation: the request's
+  response is discarded when it arrives, and its id stays reserved until it does (a
+  retry that reuses the id is answered 400 until the first call finishes or the
+  client sends `notifications/cancelled`).
 - **The 2024-11-05 HTTP+SSE transport, and HTTP batching** (removed from the
   protocol in 2025-06-18).
 - **Sessions shared between processes.** An HTTP session lives in the memory of the

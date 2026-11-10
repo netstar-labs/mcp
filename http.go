@@ -100,7 +100,8 @@ type HTTPOptions struct {
 }
 
 // HTTPHandler returns an http.Handler that serves this Server over MCP's
-// streamable-HTTP transport (revisions 2025-03-26 and 2025-06-18): POST carries
+// streamable-HTTP transport (as defined from revision 2025-03-26; the Server's
+// usual version negotiation applies, so a 2024-11-05 client is served too): POST carries
 // client→server messages, and responses come back as one JSON body or, when the
 // server has something else to say first (an elicitation, a progress
 // notification), as an SSE stream; GET opens a stream for server-initiated

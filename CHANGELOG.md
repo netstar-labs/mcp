@@ -28,7 +28,9 @@ existing callers may have relied on; the notes say which.
   mid-call with method-not-found.
 - `ClientOptions.HTTPClient == nil` means a client that follows no redirects (a 307/308 would
   replay the POST, its body and the caller's credential headers to the redirect target); a
-  redirect is reported as an error. Supply your own `HTTPClient` to follow them.
+  redirect is reported as an error (on the GET stream it ends the stream loop instead of retrying
+  the same URL), so an `http`→`https` 301/308 on a POST now fails. Supply your own `HTTPClient` to
+  follow redirects.
 - `ListTools` returns an error once a server's listing exceeds 32 MiB across pages.
 - `UnixOptions.HandshakeTimeout` no longer sets a read deadline for the connection's whole life.
   With `IdleTimeout == 0` ("disabled") a Ready session that was merely quiet was dropped after
@@ -81,8 +83,11 @@ Found by the A1 audit of this branch (records in `docs/audits/`); ids are the au
   stopped reading blocked `Close`, and with it `Session.Close`, `Serve` on shutdown,
   `Server.Close` and `Client.Close`, for as long as the peer cared to stay silent.
 - A1 C-3: `Client.call` ignored its context while the write to the peer was blocked, and so did
-  every caller queued behind it. A write abandoned for its context now sends
-  `notifications/cancelled`, since it may have reached the wire.
+  every caller queued behind it. The write lock is now a semaphore a caller waits for with its
+  own context, so a call that gives up leaves nothing behind but the one write already in
+  progress; a write abandoned for its context sends `notifications/cancelled` (bounded, 5s),
+  since it may have reached the wire, and a request whose caller gave up before it was written
+  is never sent. `Framer.Close` no longer flushes if a write is in progress (see C-2).
 - A1 C-13: header framing allocated the declared body length before any body byte arrived; 27
   bytes of input could cost 8 MiB. It now grows as the body arrives.
 - A1 C-1: an HTTP request id could be reused after its POST dropped, while the Session was still
@@ -93,12 +98,15 @@ Found by the A1 audit of this branch (records in `docs/audits/`); ids are the au
   timer, which a stream does not hold off.
 - A1 C-4: the HTTP client's exchange slots were released only when the server ended a POST, so 64
   calls to a server that ignored cancellation left the client unable to make another. A cancelled
-  call now aborts its own POST, a request past the slots is refused at once, and a notification
-  waits a bounded time for a slot.
+  call now aborts its own POST before its cancellation is queued, so it does not depend on the
+  cancellation getting through; cancellations are sent asynchronously on a budget of their own (8,
+  extras dropped); a request past the slots is refused at once; and a notification waits a
+  bounded time for a slot.
 - A1 C-5: an HTTP 200 JSON reply that was not the response to a request (a null-id error, a batch,
   another id) left the call waiting for its deadline. It now fails the call.
 - A1 C-6: a notification the server rejected (a 401 on `notifications/initialized`) was
-  swallowed, so `Initialize` reported success. The write now returns the error.
+  swallowed, so `Initialize` reported success. The write now returns the error. (A notification
+  answered 200 or 201 with no body is accepted, though the spec says 202.)
 - A1 C-16, B-1: see the behaviour changes above.
 - The client answered a server's `ping` with method-not-found.
 - A blocked or re-entrant `OnRequest` handler stalled the client's read loop, so unrelated

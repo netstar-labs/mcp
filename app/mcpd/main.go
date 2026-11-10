@@ -350,7 +350,14 @@ func readRegular(path string) ([]byte, error) {
 	if !fi.Mode().IsRegular() {
 		return nil, errors.New("not a regular file")
 	}
-	data, err := io.ReadAll(io.LimitReader(f, maxReadFileBytes+1))
+	return readBounded(f)
+}
+
+// readBounded reads at most maxReadFileBytes from r and refuses a longer source. The
+// read itself is bounded, not just the check after it: a file that grows while it is
+// read, or a /proc file that reports size 0, must not be read to the end.
+func readBounded(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxReadFileBytes+1))
 	if err != nil {
 		return nil, err
 	}
