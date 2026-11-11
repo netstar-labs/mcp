@@ -2,8 +2,9 @@
 
 No third-party dependencies, no code generation, no reflection tricks. `go.mod`
 has no require block and it stays that way. The package **serves** MCP (stdio,
-unix socket) and **consumes** it (the `Client`), sharing one `Framer` / JSON-RPC /
-protocol core across both roles — which is what lets one service front another.
+unix socket, streamable HTTP) and **consumes** it (the `Client`, over a byte
+stream or HTTP), sharing one `Framer` / JSON-RPC / protocol core across both
+roles — which is what lets one service front another.
 
 ```
 mcp/
@@ -14,12 +15,23 @@ mcp/
   session.go        per-connection state machine, read/write loops, outbound calls
   dispatch.go       method handlers, URI template matching
   transport.go      stdio, Unix sockets, systemd activation, accept loop
+  http.go           streamable-HTTP server transport: HTTPHandler, the per-session Framer bridge
+  http_client.go    DialHTTP: the Client over streamable HTTP
+  sse.go            text/event-stream reader and writer
   client.go         MCP client: Dial, Initialize, ListTools, CallTool, server→client dispatch
+  doc.go            package documentation
   peercred_linux.go SO_PEERCRED
   peercred_other.go fallback
   umask_unix.go     socket creation under a umask
   server_test.go    protocol conformance tests over a real socket
   client_test.go    client↔server round trip over an in-memory pipe
+  client_requests_test.go  client behaviour against a hand-played server: ping, cancel, paging, versions
+  http_test.go      the HTTP transport over a real listener: round trips, elicitation, admission, sessions
+  session_calls_test.go    Elicit / CreateMessage / outbound-call bounds
+  dispatch_lists_test.go   completion, resources/templates/prompts lists, list_changed broadcasts
+  transport_run_test.go    ServeStdio, ListenAndServeUnix
+  fuzz_test.go      fuzz targets for every trust boundary
+  a1_*_test.go      regressions for the A1 audit's findings (docs/audits/a1.md)
   harden_test.go    limits, quotas, deadlines, injection, cache invalidation
   audit_fixes_test.go regressions: cursor-cache bound, large-id keys, dup Content-Length
   protocol_content_test.go  Content constructors, SessionFromContext
@@ -28,7 +40,9 @@ mcp/
   bench_test.go     benchmarks
 app/mcpd/           reference daemon (the mcpd binary)
 example/stdio/      minimal runnable server (one echo tool over stdio)
-docs/               introduction · executive-summary · architecture · userguide · plan/
+example/http/       a tool over streamable HTTP behind a bearer-token wrapper
+docs/               introduction · executive-summary · architecture · userguide (plan/ untracked)
+hack/               gate.sh (the commit gate) · fuzz.sh
 build/mcp           cross-compile + package + install the daemon
 ```
 
@@ -37,7 +51,8 @@ build/mcp           cross-compile + package + install the daemon
 - **Start here** — [docs/introduction.md](docs/introduction.md) · [docs/executive-summary.md](docs/executive-summary.md)
 - **Deep dive** — [docs/architecture.md](docs/architecture.md) (this README is the reference; the docs are the guided tour)
 - **Operations** — [docs/userguide.md](docs/userguide.md)
-- **Examples** — [example/README.md](example/README.md)
+- **Examples** — [example/README.md](example/README.md); for the client/gateway
+  pattern in production, [`mcpgw`](https://github.com/netstar-labs/mcpgw)
 
 Module `github.com/netstar-labs/mcp` — the root package `mcp` is the importable
 library; `app/mcpd` is the reference daemon.
@@ -59,8 +74,9 @@ srv.AddTool(mcp.Tool{
     return mcp.ToolText("%x", sum), nil
 })
 
-// Either transport, or both at once from the same registry.
+// Any transport, or all at once from the same registry.
 go srv.ServeStdio(ctx)
+go http.ListenAndServe("127.0.0.1:8080", authenticate(srv.HTTPHandler(mcp.HTTPOptions{})))
 srv.ListenAndServeUnix(ctx, "/run/mcpd/mcpd.sock", mcp.UnixOptions{
     Mode:         0o660,
     Group:        "analysts",
@@ -83,8 +99,24 @@ all sessions sharing one registry. `@name` selects the Linux abstract
 namespace. `FramingHeaders` switches to LSP-style `Content-Length` framing when
 something in the path mangles line boundaries.
 
-**systemd** — `ListenSystemd()` adopts `LISTEN_FDS` descriptors, so the daemon
-can be socket-activated and run unprivileged.
+**systemd** — `ListenSystemd()` adopts `LISTEN_FDS` descriptors, so a daemon built
+on this package can be socket-activated and run unprivileged. (`mcpd` itself does
+not call it: it binds its own `-socket`.)
+
+**Streamable HTTP** — `Server.HTTPHandler(HTTPOptions)` returns an `http.Handler`
+(the transport as defined from revision 2025-03-26; the Server's usual version
+negotiation applies, so a 2024-11-05 client is also served over it). `POST` carries
+client→server messages; the reply is one JSON body or, when the server has something to say first (an
+elicitation, a progress notification), an SSE stream; `GET` opens a stream for
+server-initiated messages; `DELETE` ends the session. It reuses the Session
+unchanged — each HTTP session is a `Framer` that queues POST bodies for the
+Session's read loop and routes the Session's single writer's frames to the right
+stream without ever blocking it. **It does not authenticate**: wrap the handler
+in whatever does, and use `HTTPOptions.Identify` to hand that wrapper's verdict to
+the transport, which binds each session to the identity that created it and shows
+it to tool handlers as `Session.Identity()`. See [example/http](example/http/main.go).
+Mount it on one path; set `ReadHeaderTimeout` and `ReadTimeout` (not
+`WriteTimeout`, which would end every stream) on the `http.Server`.
 
 ## Client
 
@@ -97,15 +129,25 @@ c := mcp.Dial(conn, mcp.ClientOptions{Info: mcp.Implementation{Name: "mcpgw", Ve
 defer c.Close()
 if _, err := c.Initialize(ctx); err != nil { /* … */ }
 tools, _ := c.ListTools(ctx)
-res, _ := c.CallTool(ctx, "resolve", map[string]any{"name": "example.com"})
+res, _ := c.CallTool(ctx, "resolve", map[string]any{"host": "example.com"})
 ```
 
 `Dial` runs a background read loop that correlates responses by id and dispatches
-server→client requests (`elicitation/create`, …) to `ClientOptions.OnRequest`. It
-is deliberately minimal — initialize, list, call, and server-request dispatch —
-enough to drive a local tool server, not a feature-complete client. Client and
-Server share one `Framer` / JSON-RPC / protocol core, so they are wire-compatible
-by construction.
+server→client requests (`elicitation/create`, …) to `ClientOptions.OnRequest`,
+each on its own goroutine (a handler may block on a human, or call back into the
+client). The client answers `ping`, sends `notifications/cancelled` when a call's
+context ends (never for `initialize`), follows `nextCursor` across `ListTools`
+pages, and refuses a server's protocol version it does not speak. It is
+deliberately minimal — initialize, list, call, and server-request dispatch —
+enough to drive a tool server, not a feature-complete client: no resources,
+prompts or sampling, and server notifications are not surfaced. Client and Server
+share one `Framer` / JSON-RPC / protocol core, so they are wire-compatible by
+construction.
+
+`DialHTTP(ctx, endpoint, opts)` is the same client over streamable HTTP. Put a
+bearer token in `ClientOptions.Header`, or TLS and a `RoundTripper` in
+`ClientOptions.HTTPClient`. `Close` ends the server's session. A server that no
+longer knows the session ends the client with `ErrSessionExpired`: dial again.
 
 ## Security notes
 
@@ -121,8 +163,8 @@ by construction.
   all. Authorise on UID/GID; treat the PID as an audit hint, since it can be
   recycled after the peer exits.
 - Peer credentials are Linux-only here. Darwin and the BSDs need
-  `LOCAL_PEERCRED`/`getpeereid`, neither of which package `syscall` wraps —
-  see the comment in `peercred_other.go`.
+  `LOCAL_PEERCRED`/`getpeereid`; see the comment in `peercred_other.go` for why
+  this package does not take the dependency that would supply them.
 - A live socket is never unlinked. `ReplaceStale` removes a leftover file only
   after a dial proves nothing is listening, so a restart cannot silently
   hijack a running instance.
@@ -132,12 +174,33 @@ by construction.
   and header line length all have ceilings. A handler panic costs one request,
   and its stack trace is truncated before it reaches the log.
 - **Deadlines sit below the framer.** `IdleTimeout` drops a silent peer;
-  `HandshakeTimeout` drops one that connects and never initialises;
+  `HandshakeTimeout` (a timer, not a read deadline: a Ready session that is merely
+  quiet is not affected) drops one that connects and never initialises;
   `WriteTimeout` drops one that stops reading — without it a client can stall
   the session writer and back-pressure every handler behind it.
 - **`MaxConnsPerUID`** stops one local account from consuming the whole
   connection budget, which matters most on an abstract socket where filesystem
-  permissions do not apply.
+  permissions do not apply. It needs peer credentials, so off Linux it is not
+  counted (it does not refuse connections) and only `MaxConns` applies.
+- **`MaxQueuedBytes`** bounds the bytes a session's queued and running requests
+  hold (default 8 × `MaxMessageBytes`), alongside the count limit; past it a request
+  is refused as overloaded.
+- **`Broadcast` does not wait on a stuck peer.** A session whose outbound queue is
+  full is waited on while its writer makes progress and closed once it makes none for
+  5s, or when the wait reaches 30s; the others are served at once. A peer that is
+  reading at a useful rate is not closed.
+- **The HTTP transport bounds what a stranger can hold.** Sessions are capped
+  (`MaxSessions`; `MaxSessionsPerIdentity` for a caller `Identify` names) and a session that has not finished the handshake is dropped on a
+  short timer (`HandshakeTimeout`), so unauthenticated `initialize` requests cannot
+  park on slots for the full idle TTL; idle sessions expire (`SessionTTL`); a request
+  body is read through the Server's `MaxMessageBytes`; the queue to the Session and
+  the queue to each stream are bounded; a stream whose reader stops draining is
+  closed rather than allowed to stall the Session's writer; every stream write
+  carries a deadline. A request carrying a browser `Origin` is refused unless the
+  origin is listed (the DNS-rebinding guard the spec requires), and `AllowedHosts`
+  closes the rebinding case that carries no `Origin`. A session id is 128 random
+  bits, and — when `Identify` is set — is useless to any other identity (a mismatch
+  looks like an unknown session).
 - **Peer-supplied text is sanitised before it is logged.** A client naming
   itself `"evil\n2026/01/01 auth: access granted"` would otherwise forge an
   audit record. Sanitisation happens once, at the initialize boundary, so no
@@ -237,11 +300,21 @@ silently loses its answers.
 
 ## What is deliberately not here
 
-- **HTTP/SSE transport.** Streamable HTTP needs session resumption, origin
-  validation, and an auth story; that is a separate piece of work — now **scoped**
-  in [docs/plan/scope-http-transport.md](docs/plan/scope-http-transport.md), not
-  yet built (the `Framer` interface is where it plugs in). Both the server and the
-  `Client` currently speak stdio + unix-socket framing.
+- **Authentication, authorisation and OAuth on the HTTP transport.** The handler
+  is wire, not policy: it takes whatever answer a wrapper gives it (`Identify`) and
+  enforces only that a session belongs to the identity that made it. Tokens, mTLS,
+  rate limits and audit belong to the layer in front, as in
+  [`mcpgw`](https://github.com/netstar-labs/mcpgw). The protocol's own OAuth
+  resource-server metadata is not served.
+- **Stream resumption.** `Last-Event-ID` is ignored and a frame in flight when an
+  SSE stream drops is lost; a dropped POST stream is not a cancellation: the request's
+  response is discarded when it arrives, and its id stays reserved until it does (a
+  retry that reuses the id is answered 400 until the first call finishes or the
+  client sends `notifications/cancelled`).
+- **The 2024-11-05 HTTP+SSE transport, and HTTP batching** (removed from the
+  protocol in 2025-06-18).
+- **Sessions shared between processes.** An HTTP session lives in the memory of the
+  process that made it; a load balancer must pin a session to one node.
 - **JSON Schema validation of tool arguments.** Schemas are published to the
   client; validating them server-side means a schema validator, and there
   isn't one in the standard library. Handlers unmarshal into a typed struct and
@@ -252,16 +325,26 @@ silently loses its answers.
 ## Tests
 
 ```
+hack/gate.sh                          # the commit gate: vet (both platforms), -race, staticcheck, deadcode, fuzz, tidy
 go test -race -count=2 ./...
 go test -run=XXX -bench=. ./...
+FUZZTIME=30s hack/fuzz.sh             # every fuzz target
 ```
 
 (Build/test standalone with `GOWORK=off`; the module has no third-party
 requires.)
 
-58 tests, no skips on Linux. The hardening controls were mutation-tested —
-neutering `sanitize`, the batch cap, cache invalidation and the integer id path
-each produces a failing test, so none of those tests are vacuous.
+The tests cover about 85% of the root package's statements (`go test -cover .`), and
+there are seven fuzz targets (the two framers, the SSE reader, `Accept` parsing, id
+keys, URI templates, and the HTTP POST path). Two tests skip off Linux, the ones that
+need `SO_PEERCRED`. The hardening controls were mutation-tested — neutering
+`sanitize`, the batch cap, cache invalidation and the integer id path each produces
+a failing test — and so were the HTTP transport's and the A1 audit's fixes: removing
+the identity binding, the Origin and Host guards, the session cap, the handshake
+timers, the cancel handling, the non-blocking stream route, the backlog bound, the
+body cap, the version check, the duplicate-id and reserved-id checks, the client's
+ordering of notifications, its redirect refusal and its slot accounting each fails a
+test.
 
 The suite drives a real Unix socket with a hand-rolled client, so it exercises
 the wire format rather than the server's own encoder: handshake and version
@@ -277,6 +360,16 @@ framing, `SO_PEERCRED`, the peer allow-list, and concurrent dispatch.
 pipe: initialize, list, call, the execution-error vs protocol-error distinction,
 and unknown-tool — client and server from the same package, so the round trip
 proves the two are wire-compatible.
+
+`client_requests_test.go` plays the server by hand to see what the `Client` puts on
+the wire: `ping` is answered, a blocked or re-entrant `OnRequest` does not stall the
+read loop, a cancelled call sends `notifications/cancelled` (not for `initialize`),
+`ListTools` pages and refuses a cursor loop, an unsupported protocol version is an
+error. `http_test.go` drives the HTTP transport over a real listener: round trips
+through `DialHTTP`, a differential against the pipe transport (one Session, two
+transports, the same answers), JSON-or-SSE replies, an elicitation answered by a
+separate POST, Origin and Host admission, malformed requests, session binding,
+eviction, the session cap, cancellation, shutdown, and the bridge's own bounds.
 
 `harden_test.go` covers the limits and quotas: log injection, oversized ids and
 method names, batch member caps, subscription quotas, idle and handshake

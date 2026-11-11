@@ -70,7 +70,9 @@ type UnixOptions struct {
 
 	// MaxConnsPerUID bounds concurrent connections from any single peer uid,
 	// so one local account cannot exhaust the whole connection budget.
-	// Requires readable peer credentials. Zero means unlimited.
+	// Needs readable peer credentials (Linux); where they are unavailable
+	// connections are not counted per uid, and only MaxConns applies. Zero
+	// means unlimited.
 	MaxConnsPerUID int
 
 	// HandshakeTimeout drops connections that have not completed the
@@ -279,8 +281,9 @@ func (s *Server) Serve(ctx context.Context, l net.Listener, opts UnixOptions) er
 	}()
 
 	var (
-		wg      sync.WaitGroup
-		backoff time.Duration
+		wg           sync.WaitGroup
+		backoff      time.Duration
+		warnedNoCred bool
 	)
 	gate := newConnGate(opts.MaxConns, opts.MaxConnsPerUID)
 
@@ -311,6 +314,10 @@ func (s *Server) Serve(ctx context.Context, l net.Listener, opts UnixOptions) er
 		if !s.admit(conn, peer, credErr, opts) {
 			continue
 		}
+		if credErr != nil && opts.MaxConnsPerUID > 0 && !warnedNoCred {
+			warnedNoCred = true
+			s.opts.Logger.Printf("MaxConnsPerUID is not enforced: peer credentials unavailable: %v", credErr)
+		}
 		release, ok := gate.acquire(peer)
 		if !ok {
 			s.opts.Logger.Printf("rejecting connection from %s: connection limit reached", peer)
@@ -332,8 +339,10 @@ func (s *Server) Serve(ctx context.Context, l net.Listener, opts UnixOptions) er
 
 // admit applies credential policy before any protocol byte is read.
 func (s *Server) admit(c net.Conn, peer *PeerCred, credErr error, opts UnixOptions) bool {
-	needCred := opts.RequirePeerCred || opts.MaxConnsPerUID > 0 ||
-		len(opts.AllowUID) > 0 || len(opts.AllowGID) > 0
+	// MaxConnsPerUID is deliberately not here: it is a resource bound, not a
+	// credential policy, so where credentials cannot be read it degrades to
+	// untracked (see connGate) instead of refusing every connection.
+	needCred := opts.RequirePeerCred || len(opts.AllowUID) > 0 || len(opts.AllowGID) > 0
 	if credErr != nil && needCred {
 		s.opts.Logger.Printf("rejecting connection: peer credentials unavailable: %v", credErr)
 		_ = c.Close()
@@ -353,11 +362,9 @@ func (s *Server) serveAccepted(ctx context.Context, c net.Conn, peer *PeerCred, 
 	// Deadlines are enforced at the conn, below the framer, so a stalled peer
 	// cannot pin a goroutine, a buffer and a file descriptor indefinitely.
 	wrapped := &deadlineConn{Conn: c, idle: opts.IdleTimeout, write: opts.WriteTimeout}
-	if opts.HandshakeTimeout > 0 && opts.IdleTimeout == 0 {
-		// Give the handshake its own read bound even when no idle timeout is
-		// configured.
-		wrapped.idle = opts.HandshakeTimeout
-	}
+	// The handshake is bounded by the timer in OnSession below, not by a read
+	// deadline: a deadline set here would last as long as the connection and drop a
+	// Ready session that is merely quiet, which IdleTimeout == 0 documents as allowed.
 
 	framer := NewFramer(wrapped, wrapped, FramerOptions{
 		Mode:            opts.Framing,

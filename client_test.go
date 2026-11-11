@@ -95,3 +95,61 @@ func TestClientUnknownTool(t *testing.T) {
 		t.Fatal("unknown tool should surface as a JSON-RPC error")
 	}
 }
+
+// TestClientElicitationCapabilityMatchesHandler: the client advertises
+// elicitation only when it has a handler that can answer one. A server checks
+// the advertised capability before eliciting (Session.Elicit), so advertising it
+// with a nil OnRequest makes that check pass and then answers the elicitation
+// with method-not-found mid-call — the failure lands on the server's user, far
+// from the client that mis-advertised. The round-trip asserts what the SERVER
+// sees, which is the only thing that governs its behaviour.
+func TestClientElicitationCapabilityMatchesHandler(t *testing.T) {
+	// dial spins a server whose tool reports the client capabilities it observed.
+	dial := func(t *testing.T, opts ClientOptions) (*Client, context.CancelFunc) {
+		t.Helper()
+		srv := New(Options{Name: "test", Version: "0"})
+		_ = srv.AddTool(
+			Tool{Name: "caps", InputSchema: json.RawMessage(`{"type":"object"}`)},
+			func(ctx context.Context, s *Session, _ json.RawMessage) (*CallToolResult, error) {
+				if s.ClientCapabilities().Elicitation != nil {
+					return ToolText("elicitation"), nil
+				}
+				return ToolText("none"), nil
+			})
+		c1, c2 := net.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			_ = srv.ServeConn(ctx, NewFramer(c1, c1, FramerOptions{Mode: FramingLines, Closer: c1}), ConnConfig{Remote: "test"})
+		}()
+		return Dial(c2, opts), cancel
+	}
+
+	observe := func(t *testing.T, opts ClientOptions) string {
+		t.Helper()
+		client, cancel := dial(t, opts)
+		defer cancel()
+		defer client.Close()
+		ctx, c := context.WithTimeout(context.Background(), 5*time.Second)
+		defer c()
+		if _, err := client.Initialize(ctx); err != nil {
+			t.Fatalf("initialize: %v", err)
+		}
+		res, err := client.CallTool(ctx, "caps", nil)
+		if err != nil {
+			t.Fatalf("caps: %v", err)
+		}
+		if len(res.Content) == 0 {
+			t.Fatal("caps returned no content")
+		}
+		return res.Content[0].Text
+	}
+
+	info := Implementation{Name: "c", Version: "0"}
+	if got := observe(t, ClientOptions{Info: info}); got != "none" {
+		t.Errorf("nil OnRequest advertised %q; a client that cannot answer must not advertise elicitation", got)
+	}
+	handler := func(context.Context, string, json.RawMessage) (any, *RPCError) { return map[string]any{}, nil }
+	if got := observe(t, ClientOptions{Info: info, OnRequest: handler}); got != "elicitation" {
+		t.Errorf("OnRequest set advertised %q, want elicitation", got)
+	}
+}

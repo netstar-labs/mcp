@@ -1,17 +1,18 @@
 # mcp — architecture
 
 A flat library at the repo root (`package mcp`), one concern per file, with the
-reference daemon under `app/mcpd`. It now implements **both roles** — the server
+reference daemon under `app/mcpd`. It implements **both roles** — the server
 (most of the files below) and a matching `Client` (`client.go`) that consumes an MCP
-server over the same wire. The README is the full reference (security, performance,
+server over the same wire — and **three transport families**: stdio, Unix sockets,
+and streamable HTTP. The README is the full reference (security, performance,
 protocol coverage, the bugs the hardening found); this is the guided tour of the
 subsystems and the data flow.
 
 ## Data flow
 
 ```
-transport (stdio | unix | systemd)
-   │  accept + peer creds + admission
+transport (stdio | unix | systemd | http)
+   │  accept + peer creds + admission   (http: Origin/Host guard, session lookup, identity bind)
    ▼
 framer (NDJSON lines | Content-Length headers)   ── size-capped as it reads
    │  one message at a time, buffer reused (RawMessage is copied by encoding/json)
@@ -46,11 +47,25 @@ registry (tools / resources / prompts)  ──▶ handler ──▶ result ─�
 - **`client.go`** — the other role on the same wire. `Dial` opens a `Client` over
   any `io.ReadWriteCloser` (Unix socket, stdio pipe pair, in-memory pipe); a
   background read loop correlates responses by JSON-RPC id, serialises writes, and
-  dispatches server→client requests (`elicitation/create`) to an `OnRequest`
-  handler. `Initialize` / `ListTools` / `CallTool` / `Close`. Reuses `framing.go`,
-  `jsonrpc.go`, and `protocol.go` unchanged — one wire, two roles — and is
-  deliberately minimal (no resources/prompts/sampling, no pagination past the first
-  page).
+  dispatches server→client requests (`elicitation/create`, and `ping`, which it
+  always answers) to an `OnRequest` handler, each on its own goroutine so a handler
+  may block on a human or call back into the client. A call whose context ends sends
+  `notifications/cancelled` (never for `initialize`); `ListTools` follows
+  `nextCursor` (bounded, and a repeated cursor is an error). `Initialize` /
+  `ListTools` / `CallTool` / `Close`. Reuses `framing.go`, `jsonrpc.go`, and
+  `protocol.go` unchanged — one wire, two roles — and is deliberately minimal (no
+  resources/prompts/sampling, no server notifications). Its production consumer is
+  [`mcpgw`](https://github.com/netstar-labs/mcpgw), which mounts an upstream tool
+  server's tools as gated proxies over a unix socket or a spawned stdio child.
+- **`http.go`** — the streamable-HTTP server transport; see "The HTTP bridge" below.
+- **`http_client.go`** — `DialHTTP`: the same `Client`, over a `Framer` that turns
+  each message into a POST. A request is sent on its own goroutine (the client holds
+  a write lock around `WriteMessage`, and a POST that waited for its response would
+  serialise every concurrent call); a notification or reply is sent before
+  `WriteMessage` returns, because separate HTTP requests have no order and
+  `notifications/initialized` must reach the server before the next request.
+- **`sse.go`** — a `text/event-stream` reader (size-capped as bytes arrive, like the
+  framer) and a writer that puts a deadline on every write.
 - **`transport.go`** — `ServeStdio`, `ListenUnix` (umask creation, stale reclaim,
   symlink refusal, mode/owner verification), `ListenSystemd`, the accept loop with
   admission, and the connection gate (total + per-UID caps).
@@ -73,12 +88,54 @@ registry (tools / resources / prompts)  ──▶ handler ──▶ result ─�
   subscriptions, pending calls, per-UID connections. Hostile input is the design
   center, not an afterthought.
 - **Peer creds are Linux-only** — the honest platform boundary of a stdlib-only
-  build; off-Linux, admission that needs creds fails closed and socket-file
-  permissions carry the access control.
+  build; off-Linux, admission that needs creds (an allow-list, or `RequirePeerCred`)
+  fails closed and socket-file permissions carry the access control; `MaxConnsPerUID`
+  is simply not counted there.
 - **stdio owns stdout** — nothing else in the process may write there; the logger
   defaults to stderr.
-- **HTTP is scoped, not built** — server and client both speak stdio + Unix-socket
-  framing today. The streamable-HTTP transport is designed (a per-session
-  `httpFramer` presenting a `Framer` to the existing Session, unchanged —
-  [plan/scope-http-transport.md](plan/scope-http-transport.md)) but not yet
-  implemented; the `Framer` interface is the seam it plugs into.
+- **HTTP is wire, not policy** — the handler does not authenticate. It takes the
+  answer of whatever wraps it (`HTTPOptions.Identify`) and enforces only that a
+  session belongs to the identity that made it. That keeps the credentials, the
+  rate limits and the audit trail in the layer that owns them (as in
+  [`mcpgw`](https://github.com/netstar-labs/mcpgw)), and the transport small enough
+  to audit.
+
+## The HTTP bridge
+
+Streamable HTTP is request-scoped; a `Session` wants one persistent `Framer`. The
+bridge is `httpSession`, a `Framer` per HTTP session, and the only hard part of the
+transport:
+
+- **Inbound.** Each POST body is parsed once at the boundary (size, JSON, id and
+  method limits, kind) and queued, in order, for `ReadMessage` — which is the
+  Session's unchanged read loop. A full queue answers 503, never blocks.
+- **Outbound.** The Session has one writer goroutine, and every handler's reply
+  queues behind it, so `WriteMessage` must never block. It routes each frame with
+  non-blocking sends: a **response** to the POST waiting for that id; a
+  **server-initiated** frame to the GET stream if one is open, else to the oldest
+  POST still waiting (a progress notification or elicitation mid-call), else into a
+  bounded backlog for the next GET. A stream that does not drain is closed, not
+  waited for. Nothing a client does can stall another client's replies.
+- **JSON or SSE, decided late.** A POST waits on its own channels. If the response
+  is the first thing the Session says, the reply is one JSON body; if anything is
+  routed to the POST first, the reply becomes an SSE stream carrying those frames
+  and then the response. Everything queued ahead of the response is delivered
+  before it (one writer, in order).
+- **Cancellation is two different things.** `notifications/cancelled` ends the
+  POST of the request it names (the Session suppresses that reply, so nothing else
+  would end it). A dropped connection is *not* a cancellation: the request keeps
+  running and its response is discarded when it arrives. Its id stays reserved
+  (the waiter is marked abandoned, and nothing is routed to it) until the Session
+  answers it or the client cancels it, so a retry that reuses the id is answered
+  400 rather than handed the first call's reply.
+- **Lifecycle.** A session id is minted at `initialize` (128 random bits) and
+  returned only with a successful handshake. Sessions are capped, expire on a short
+  handshake timer and then an idle TTL (an open stream or in-flight request holds
+  one open), and are released from one place, `Close`, whoever asks: `DELETE`, the
+  timer, `Server.Close`, or the Session ending. Closing cancels the context the
+  Session's handlers run under.
+- **Known limits.** Elicitations are routed by "oldest waiting POST", not by the
+  request that raised them, because `Session.Call` does not carry the originating
+  request id; the spec says such messages SHOULD relate to the request, and a client
+  correlates by JSON-RPC id regardless of stream, so this is cosmetic. No
+  resumption: a frame in flight when a stream drops is lost.

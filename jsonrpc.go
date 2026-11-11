@@ -28,6 +28,10 @@ const (
 	CodeRequestTooLarge  = -32003
 	CodeResourceNotFound = -32004 // used by resources/read per MCP convention
 	CodeResourceLimit    = -32005 // a per-session quota was exhausted
+
+	// CodeRequestCancelled is the code a transport answers with for a request
+	// the peer cancelled before it completed (the LSP value, which MCP follows).
+	CodeRequestCancelled = -32800
 )
 
 // Structural limits applied to every inbound message. These are deliberately
@@ -120,6 +124,22 @@ func (m *wireMessage) validate() *RPCError {
 	return nil
 }
 
+// checkVersion rejects a message whose "jsonrpc" member is not "2.0", whatever
+// its kind. It returns the id the error reply carries: the request's own, so
+// the caller can match it, and null for everything else, which has none. The
+// error does not quote the peer's string, which has no length bound but the
+// frame's.
+func (m *wireMessage) checkVersion() (json.RawMessage, *RPCError) {
+	if m.JSONRPC == JSONRPCVersion {
+		return nil, nil
+	}
+	id := json.RawMessage(nullLiteral)
+	if m.kind() == kindRequest {
+		id = m.ID
+	}
+	return id, Errorf(CodeInvalidRequest, "jsonrpc must be %q", JSONRPCVersion)
+}
+
 var nullLiteral = []byte("null")
 
 // Outbound shapes. These are separate types so that required members are
@@ -192,8 +212,13 @@ func idKey(raw json.RawMessage) string {
 	}
 	if f, err := strconv.ParseFloat(ts, 64); err == nil {
 		// Integral floats normalise to the integer form so 7 and 7.0 agree.
-		if n := int64(f); float64(n) == f {
-			return string(strconv.AppendInt(append(buf[:0], 'n', ':'), n, 10))
+		// Only in-range values are converted: out of range, the result of int64(f)
+		// is implementation-defined, and 2^63 aliased 2^63-1 on arm64 but not amd64.
+		const two63 = 1 << 63
+		if f >= -two63 && f < two63 {
+			if n := int64(f); float64(n) == f {
+				return string(strconv.AppendInt(append(buf[:0], 'n', ':'), n, 10))
+			}
 		}
 		return string(strconv.AppendFloat(append(buf[:0], 'n', ':'), f, 'g', -1, 64))
 	}
@@ -256,6 +281,21 @@ func marshal(v any) ([]byte, error) {
 		encPool.Put(e)
 	}
 	return out, nil
+}
+
+// encodeParams marshals the params of an outgoing request or notification, and
+// maps "no params" (nil, which marshals to null) to an absent member: null is not a
+// legal params value, and the Session, the Client and the HTTP client must agree on
+// the shape they put on the wire.
+func encodeParams(v any) (json.RawMessage, error) {
+	b, err := marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if bytes.Equal(b, nullLiteral) {
+		return nil, nil
+	}
+	return b, nil
 }
 
 // unmarshalParams decodes request params, tolerating an absent params member.

@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+# The token needs to read the repository and nothing else.
+permissions:
+  contents: read
+
+env:
+  GOWORK: "off"
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: cross-vet the other platform
+        run: GOOS=${{ matrix.os == 'ubuntu-latest' && 'darwin' || 'linux' }} go vet ./...
+      - name: test (race)
+        run: go test -race -count=1 ./...
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: every fuzz target for the gate's budget
+        run: FUZZTIME=20s hack/fuzz.sh
+
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # Pinned, not @latest: a check that can start failing with no change in the repo is
+      # not a gate. The same pins are in hack/gate.sh; bump them together. The tools may need a
+      # newer Go than go.mod asks for (staticcheck v0.8.2 wants 1.26), and setup-go pins
+      # GOTOOLCHAIN=local, so they run with auto, as in hack/gate.sh; the repo's own build and
+      # tidy stay on the toolchain go.mod names.
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+        env:
+          GOTOOLCHAIN: auto
+      # deadcode exits 0 even when it finds something; only an empty report passes.
+      - run: test -z "$(go run golang.org/x/tools/cmd/deadcode@v0.52.0 -test ./...)"
+        env:
+          GOTOOLCHAIN: auto
+      - run: go mod tidy && git diff --exit-code -- go.mod go.sum
+      - name: no module dependencies, ever
+        run: "! grep -q '^require' go.mod"
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+        env:
+          GOTOOLCHAIN: auto

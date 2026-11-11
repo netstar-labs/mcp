@@ -25,6 +25,16 @@ const (
 	DefaultMaxSubscriptions      = 1024
 	DefaultMaxBatchItems         = 64
 	DefaultMaxPendingCalls       = 256
+
+	// defaultBroadcastGrace is how long a fan-out lets a session whose
+	// outbound queue is full go without its writer making progress before
+	// closing it.
+	defaultBroadcastGrace = 5 * time.Second
+	// defaultBroadcastMaxWait is the most a fan-out waits on one session even
+	// if its writer keeps making progress: a peer that drains a frame every few
+	// seconds is as good as stalled, and would otherwise hold the caller for as
+	// long as the replies queued ahead of the notification take.
+	defaultBroadcastMaxWait = 30 * time.Second
 )
 
 func sprintf(format string, args ...any) string {
@@ -94,6 +104,16 @@ type Options struct {
 	// MaxConcurrentRequests bounds in-flight handlers per session.
 	// Default DefaultMaxConcurrentRequests.
 	MaxConcurrentRequests int
+
+	// MaxQueuedBytes bounds, per session, the bytes held by requests that are
+	// queued or running (counted as the length of each request's frame). A request that would
+	// exceed it is refused with the same "overloaded" error as one past the
+	// count limit, except that a request is always admitted when the session
+	// holds nothing else, so a small value never makes a large message
+	// impossible. MaxConcurrentRequests*8 requests may queue, so without a byte
+	// bound one session could hold that many MaxMessageBytes messages.
+	// Default 8 * MaxMessageBytes.
+	MaxQueuedBytes int
 
 	// MaxSubscriptions bounds resource subscriptions per session, so a client
 	// cannot grow the server's memory by subscribing in a loop.
@@ -188,6 +208,14 @@ type Server struct {
 	templateCache listCache
 	promptCache   listCache
 
+	// broadcastGrace is how long a fan-out lets a session whose outbound queue
+	// is full go without its writer making progress before closing it. A field
+	// so tests can shorten it.
+	broadcastGrace time.Duration
+	// broadcastMaxWait caps how long a fan-out waits on one session that is
+	// making progress, however slowly. A field so tests can shorten it.
+	broadcastMaxWait time.Duration
+
 	sessMu   sync.Mutex
 	sessions map[*Session]struct{}
 	closed   bool
@@ -211,6 +239,7 @@ func New(opts Options) *Server {
 	setDefault(&opts.MaxMessageBytes, DefaultMaxMessageBytes)
 	setDefault(&opts.BufferSize, DefaultBufferSize)
 	setDefault(&opts.MaxConcurrentRequests, DefaultMaxConcurrentRequests)
+	setDefault(&opts.MaxQueuedBytes, 8*opts.MaxMessageBytes)
 	setDefault(&opts.MaxSubscriptions, DefaultMaxSubscriptions)
 	setDefault(&opts.MaxBatchItems, DefaultMaxBatchItems)
 	setDefault(&opts.MaxPendingCalls, DefaultMaxPendingCalls)
@@ -219,11 +248,13 @@ func New(opts Options) *Server {
 		opts.DrainTimeout = DefaultDrainTimeout
 	}
 	return &Server{
-		opts:      opts,
-		tools:     make(map[string]*toolEntry),
-		resources: make(map[string]*resourceEntry),
-		prompts:   make(map[string]*promptEntry),
-		sessions:  make(map[*Session]struct{}),
+		opts:             opts,
+		broadcastGrace:   defaultBroadcastGrace,
+		broadcastMaxWait: defaultBroadcastMaxWait,
+		tools:            make(map[string]*toolEntry),
+		resources:        make(map[string]*resourceEntry),
+		prompts:          make(map[string]*promptEntry),
+		sessions:         make(map[*Session]struct{}),
 	}
 }
 
@@ -384,35 +415,82 @@ func (s *Server) negotiate(requested string) string {
 }
 
 // Broadcast sends a notification to every session that has completed
-// initialization. Errors are logged, not returned. Note: it sends sequentially,
-// and Notify blocks on the session's outbound queue — so a client that stalls
-// its reads can hold up the broadcast unless a WriteTimeout is set (mcpd sets
-// one; the library default is 0). Set Options... WriteTimeout in production so
-// one wedged client cannot stall the others.
+// initialization. Errors are logged, not returned. A session whose outbound
+// queue is full is waited on, together with any others in that state, and is
+// closed if its writer makes no progress for a grace period (5s; a peer that
+// stalls after one more write is closed within twice that) or if the wait has
+// lasted 30s in all. A peer that has stopped reading therefore loses its
+// connection rather than back-pressuring everyone, and so does one that reads too
+// slowly to matter, which would otherwise hold the caller for as long as the
+// replies queued ahead of the frame take to drain; a client that reconnects
+// refreshes what the notification would have told it. A peer that reads at a
+// useful rate is waited on and not closed, which can take up to the 30s, even with
+// UnixOptions.WriteTimeout unset. A single write of one very large frame that
+// outlasts the grace counts as no progress. Session.Notify, by contrast, still
+// blocks on a full queue, because ordering with replies matters to its callers.
 func (s *Server) Broadcast(method string, params any) {
+	var ready []*Session
 	for _, sess := range s.Sessions() {
-		if sess.State() != StateReady {
-			continue
-		}
-		if err := sess.Notify(method, params); err != nil {
-			s.opts.Logger.Printf("broadcast %s to %s: %v", method, sess.RemoteAddr(), err)
+		if sess.State() == StateReady {
+			ready = append(ready, sess)
 		}
 	}
+	s.fanout(ready, method, params, func(sess *Session, err error) {
+		s.opts.Logger.Printf("broadcast %s to %s: %v", method, sess.RemoteAddr(), err)
+	})
+}
+
+// fanout delivers one notification to each of sessions. A session whose
+// queue has room gets it at once; those whose queue is full are waited on
+// together, and closed if their writer makes no progress for broadcastGrace.
+func (s *Server) fanout(sessions []*Session, method string, params any, logErr func(*Session, error)) {
+	frame, err := encodeNotification(method, params)
+	if err != nil {
+		s.opts.Logger.Printf("notify %s: %v", sanitize(method), err)
+		return
+	}
+	var slow []*Session
+	for _, sess := range sessions {
+		switch err := sess.offer(frame); {
+		case err == nil:
+		case errors.Is(err, errQueueFull):
+			slow = append(slow, sess)
+		default:
+			logErr(sess, err)
+		}
+	}
+	if len(slow) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	for _, sess := range slow {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := sess.offerWithin(frame, s.broadcastGrace, s.broadcastMaxWait); err != nil {
+				logErr(sess, err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func (s *Server) NotifyToolListChanged()     { s.Broadcast(NotifyToolsChanged, struct{}{}) }
 func (s *Server) NotifyResourceListChanged() { s.Broadcast(NotifyResourcesChanged, struct{}{}) }
 func (s *Server) NotifyPromptListChanged()   { s.Broadcast(NotifyPromptsChanged, struct{}{}) }
 
-// NotifyResourceUpdated informs only those sessions that subscribed to the URI.
+// NotifyResourceUpdated informs only those sessions that subscribed to the URI,
+// with the same handling of a session that stopped reading as Broadcast.
 func (s *Server) NotifyResourceUpdated(uri string) {
+	var subscribed []*Session
 	for _, sess := range s.Sessions() {
 		if sess.State() == StateReady && sess.isSubscribed(uri) {
-			if err := sess.Notify(NotifyResourceUpdated, ResourceUpdatedParams{URI: uri}); err != nil {
-				s.opts.Logger.Printf("notify update %s: %v", sanitize(uri), err)
-			}
+			subscribed = append(subscribed, sess)
 		}
 	}
+	s.fanout(subscribed, NotifyResourceUpdated, ResourceUpdatedParams{URI: uri}, func(_ *Session, err error) {
+		s.opts.Logger.Printf("notify update %s: %v", sanitize(uri), err)
+	})
 }
 
 // Sessions returns a snapshot of the live sessions.

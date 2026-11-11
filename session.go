@@ -64,6 +64,7 @@ type Session struct {
 	framer Framer
 	remote string
 	peer   *PeerCred
+	ident  string
 
 	state atomic.Int32
 
@@ -79,6 +80,12 @@ type Session struct {
 	sem      chan struct{}
 	queued   atomic.Int32
 	maxQueue int32
+	// queuedBytes is what the queued and running requests hold, against
+	// Options.MaxQueuedBytes.
+	queuedBytes atomic.Int64
+	// written counts the frames the writer has handed to the transport; a
+	// writer that is making progress has a peer that is reading.
+	written atomic.Uint64
 
 	mu         sync.Mutex
 	clientInfo Implementation
@@ -102,6 +109,12 @@ func (s *Session) RemoteAddr() string { return s.remote }
 
 // Peer returns the peer's Unix credentials, or nil when unavailable.
 func (s *Session) Peer() *PeerCred { return s.peer }
+
+// Identity is the caller identity the transport's wrapper vouched for (see
+// HTTPOptions.Identify), or "" when none did. It is whatever the wrapper
+// returned, verbatim: this package does not authenticate, it only carries the
+// answer to the handlers that have to authorise by it.
+func (s *Session) Identity() string { return s.ident }
 
 // ClientInfo returns the implementation the client declared at initialize.
 func (s *Session) ClientInfo() Implementation {
@@ -155,6 +168,10 @@ type ConnConfig struct {
 	// Peer carries kernel-attested credentials, when available.
 	Peer *PeerCred
 
+	// Identity is a caller identity vouched for by something in front of this
+	// package, exposed to handlers as Session.Identity.
+	Identity string
+
 	// OnSession, if set, runs once with the new Session before the read loop
 	// starts. It is the hook transports use to arm a handshake timer.
 	OnSession func(*Session)
@@ -164,6 +181,7 @@ type ConnConfig struct {
 // disconnects, the context is cancelled, or a fatal framing error occurs.
 func (s *Server) ServeConn(ctx context.Context, f Framer, cfg ConnConfig) error {
 	sess := newSession(s, f, cfg.Remote, cfg.Peer)
+	sess.ident = cfg.Identity
 	if cfg.OnSession != nil {
 		cfg.OnSession(sess)
 	}
@@ -250,7 +268,11 @@ func (s *Session) handleFrame(ctx context.Context, frame []byte) {
 		s.sendError(nullLiteral, rerr)
 		return
 	}
-	s.route(ctx, &wm)
+	if id, rerr := wm.checkVersion(); rerr != nil {
+		s.sendError(id, rerr)
+		return
+	}
+	s.route(ctx, &wm, len(trimmed))
 }
 
 // handleBatch runs the members of a JSON-RPC batch sequentially on the read loop.
@@ -295,6 +317,10 @@ func (s *Session) handleBatch(ctx context.Context, frame []byte) {
 			replies = append(replies, marshalError(nullLiteral, rerr))
 			continue
 		}
+		if id, rerr := wm.checkVersion(); rerr != nil {
+			replies = append(replies, marshalError(id, rerr))
+			continue
+		}
 		switch wm.kind() {
 		case kindRequest:
 			replies = append(replies, s.runRequestSync(ctx, &wm))
@@ -311,13 +337,9 @@ func (s *Session) handleBatch(ctx context.Context, frame []byte) {
 	}
 }
 
-func (s *Session) route(ctx context.Context, wm *wireMessage) {
+func (s *Session) route(ctx context.Context, wm *wireMessage, frameBytes int) {
 	switch wm.kind() {
 	case kindRequest:
-		if wm.JSONRPC != JSONRPCVersion {
-			s.sendError(wm.ID, Errorf(CodeInvalidRequest, "unsupported jsonrpc version %q", wm.JSONRPC))
-			return
-		}
 		if wm.Method == MethodInitialize {
 			// Run the handshake inline. A conformant client waits for the
 			// initialize result before sending notifications/initialized, but
@@ -328,7 +350,7 @@ func (s *Session) route(ctx context.Context, wm *wireMessage) {
 			}
 			return
 		}
-		s.spawnRequest(ctx, wm)
+		s.spawnRequest(ctx, wm, frameBytes)
 	case kindNotification:
 		// Notifications are processed inline, in arrival order. Dispatching
 		// them concurrently would let a request overtake the
@@ -349,17 +371,30 @@ func (s *Session) route(ctx context.Context, wm *wireMessage) {
 // admitted up to maxQueue and then rejected; actual work is capped by the
 // semaphore, and keeping the read loop free is what lets a cancel through under
 // load.
-func (s *Session) spawnRequest(ctx context.Context, wm *wireMessage) {
+func (s *Session) spawnRequest(ctx context.Context, wm *wireMessage, frameBytes int) {
 	if s.queued.Add(1) > s.maxQueue {
 		s.queued.Add(-1)
 		s.sendError(wm.ID, Errorf(CodeInternalError, "server is overloaded; retry later"))
 		return
 	}
+	// Only the read loop admits, so the check-then-add below cannot race with
+	// another admission; completions only lower the total.
+	// The whole frame is counted, not the members the dispatcher reads: the
+	// decoded message also keeps any "result" or "error" a request carries, and
+	// the frame's length bounds whatever it keeps.
+	size := int64(frameBytes)
+	if held := s.queuedBytes.Load(); held > 0 && held+size > int64(s.server.opts.MaxQueuedBytes) {
+		s.queued.Add(-1)
+		s.sendError(wm.ID, Errorf(CodeInternalError, "server is overloaded; too many request bytes queued; retry later"))
+		return
+	}
+	s.queuedBytes.Add(size)
 	reqCtx, entry, release := s.registerInflight(ctx, wm)
 	s.work.Add(1)
 	go func() {
 		defer s.work.Done()
 		defer s.queued.Add(-1)
+		defer s.queuedBytes.Add(-size)
 		defer release()
 		if reply := s.runRegistered(reqCtx, wm, entry); reply != nil {
 			s.sendRaw(reply)
@@ -464,6 +499,7 @@ func (s *Session) writeLoop() {
 			_ = s.Close()
 			return false
 		}
+		s.written.Add(1)
 		return true
 	}
 	for {
@@ -540,16 +576,67 @@ func marshalError(id json.RawMessage, e *RPCError) json.RawMessage {
 	return mustMarshal(outError{JSONRPC: JSONRPCVersion, ID: id, Error: e})
 }
 
+// encodeNotification builds the wire frame of a notification.
+func encodeNotification(method string, params any) ([]byte, error) {
+	encoded, err := encodeParams(params)
+	if err != nil {
+		return nil, err
+	}
+	return marshal(outNotification{JSONRPC: JSONRPCVersion, Method: method, Params: encoded})
+}
+
+var (
+	errSessionClosed = errors.New("mcp: session closed")
+	errQueueFull     = errors.New("mcp: session outbound queue is full")
+)
+
+// offer queues a frame without blocking: nil if queued, errQueueFull if the
+// queue has no room, errSessionClosed if the session is gone.
+func (s *Session) offer(frame []byte) error {
+	select {
+	case <-s.done:
+		return errSessionClosed
+	default:
+	}
+	select {
+	case s.out <- frame:
+		return nil
+	default:
+		return errQueueFull
+	}
+}
+
+// offerWithin waits for room in the queue. It closes the session if the writer
+// makes no progress for grace (a peer that has stopped reading), or if the wait
+// has lasted limit in all: a peer that reads, but slowly enough to hold the
+// caller for as long as the replies queued ahead of the frame take, is as good as
+// gone. A peer that reads at a useful rate is waited on, since the frame may be
+// queued behind every reply a busy session has in flight.
+func (s *Session) offerWithin(frame []byte, grace, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	t := time.NewTimer(grace)
+	defer t.Stop()
+	for {
+		seen := s.written.Load()
+		select {
+		case s.out <- frame:
+			return nil
+		case <-s.done:
+			return errSessionClosed
+		case <-t.C:
+			if s.written.Load() != seen && time.Now().Before(deadline) {
+				t.Reset(grace)
+				continue
+			}
+			_ = s.Close()
+			return fmt.Errorf("closed: outbound queue did not drain (grace %v, limit %v)", grace, limit)
+		}
+	}
+}
+
 // Notify sends a notification to the client.
 func (s *Session) Notify(method string, params any) error {
-	encoded, err := marshal(params)
-	if err != nil {
-		return err
-	}
-	if bytes.Equal(encoded, nullLiteral) {
-		encoded = nil
-	}
-	frame, err := marshal(outNotification{JSONRPC: JSONRPCVersion, Method: method, Params: encoded})
+	frame, err := encodeNotification(method, params)
 	if err != nil {
 		return err
 	}
@@ -557,7 +644,7 @@ func (s *Session) Notify(method string, params any) error {
 	case s.out <- frame:
 		return nil
 	case <-s.done:
-		return errors.New("mcp: session closed")
+		return errSessionClosed
 	}
 }
 
@@ -590,13 +677,10 @@ func (s *Session) Call(ctx context.Context, method string, params, result any) e
 		s.pendMu.Unlock()
 	}
 
-	encoded, err := marshal(params)
+	encoded, err := encodeParams(params)
 	if err != nil {
 		cleanup()
 		return err
-	}
-	if bytes.Equal(encoded, nullLiteral) {
-		encoded = nil
 	}
 	frame, err := marshal(outRequest{JSONRPC: JSONRPCVersion, ID: rawID, Method: method, Params: encoded})
 	if err != nil {
