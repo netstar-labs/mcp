@@ -74,6 +74,17 @@ func (c *testClient) readErrorFrame() wireMessage {
 	}
 }
 
+// expectNoReply proves the server sent nothing for the message just sent: the
+// read loop is sequential, so the next frame must be the answer to a ping sent
+// after it.
+func (c *testClient) expectNoReply() {
+	c.t.Helper()
+	c.send(map[string]any{"jsonrpc": "2.0", "id": 9001, "method": MethodPing})
+	if wm := c.readRaw(); string(wm.ID) != "9001" {
+		c.t.Fatalf("got an unsolicited frame %+v, want only the answer to the ping", wm)
+	}
+}
+
 func TestBadVersionNotificationIsRejectedAndDoesNotInitialize(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -89,10 +100,9 @@ func TestBadVersionNotificationIsRejectedAndDoesNotInitialize(t *testing.T) {
 				ClientInfo:      Implementation{Name: "c", Version: "1"},
 			})
 			c.send(tc.msg)
-			e := c.readErrorFrame()
-			if e.Error.Code != CodeInvalidRequest || string(e.ID) != "null" {
-				t.Fatalf("reply = code %d id %s, want %d with a null id", e.Error.Code, e.ID, CodeInvalidRequest)
-			}
+			// A notification has no one to answer, and an error frame sent
+			// for it is itself unanswerable: two sessions would trade them.
+			c.expectNoReply()
 			// The rejected notification must not have completed the handshake.
 			if err := c.requestErr(MethodToolsList, nil); err.Code != CodeNotInitialized {
 				t.Fatalf("tools/list after a rejected initialized: code %d, want %d", err.Code, CodeNotInitialized)
@@ -127,8 +137,8 @@ func TestBadVersionInsideABatch(t *testing.T) {
 	if err := json.Unmarshal(line, &replies); err != nil {
 		t.Fatalf("batch reply is not an array: %s", line)
 	}
-	if len(replies) != 3 {
-		t.Fatalf("got %d replies, want 3 (ok, error for id 2, error for the notification): %s", len(replies), line)
+	if len(replies) != 2 {
+		t.Fatalf("got %d replies, want 2 (ok, error for id 2; none for the notification): %s", len(replies), line)
 	}
 	if replies[0].Error != nil || string(replies[0].ID) != "1" {
 		t.Fatalf("member 1 = %+v, want a result for id 1", replies[0])
@@ -136,8 +146,51 @@ func TestBadVersionInsideABatch(t *testing.T) {
 	if replies[1].Error == nil || string(replies[1].ID) != "2" {
 		t.Fatalf("member 2 = %+v, want an error for id 2", replies[1])
 	}
-	if replies[2].Error == nil || string(replies[2].ID) != "null" {
-		t.Fatalf("member 3 = %+v, want an error with a null id", replies[2])
+}
+
+// A batch whose members all go unanswered gets no reply at all, not an empty
+// or error-filled array.
+func TestBatchOfBadVersionNotificationsGetsNoReply(t *testing.T) {
+	_, c := newTestServer(t, nil)
+	c.handshake()
+	c.send([]map[string]any{
+		{"jsonrpc": "1.0", "method": "notifications/a"},
+		{"method": "notifications/b"},
+	})
+	c.expectNoReply()
+}
+
+// An error response is never answered, even when it is malformed: the error a
+// server sends for an unreadable request has a null id and no method, and two
+// servers that each reply to that with another such error would never stop.
+func TestErrorShapedMessagesAreNeverAnswered(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  any
+	}{
+		{"null id error", map[string]any{"jsonrpc": "2.0", "id": nil, "error": map[string]any{"code": CodeInvalidRequest, "message": "x"}}},
+		{"no id error", map[string]any{"jsonrpc": "2.0", "error": map[string]any{"code": CodeInvalidRequest, "message": "x"}}},
+		{"null id result", map[string]any{"jsonrpc": "2.0", "id": nil, "result": map[string]any{}}},
+		{"bad version null id error", map[string]any{"jsonrpc": "1.0", "id": nil, "error": map[string]any{"code": CodeInvalidRequest, "message": "x"}}},
+		{"in a batch", []map[string]any{{"jsonrpc": "2.0", "id": nil, "error": map[string]any{"code": CodeInvalidRequest, "message": "x"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, c := newTestServer(t, nil)
+			c.handshake()
+			c.send(tc.msg)
+			c.expectNoReply()
+		})
+	}
+}
+
+// What is still answered with a null id: a message that is neither request,
+// notification nor response-shaped.
+func TestInvalidRequestStillGetsAnError(t *testing.T) {
+	_, c := newTestServer(t, nil)
+	c.handshake()
+	c.send(map[string]any{"jsonrpc": "2.0"})
+	if e := c.readErrorFrame(); e.Error.Code != CodeInvalidRequest || string(e.ID) != "null" {
+		t.Fatalf("reply = code %d id %s, want %d with a null id", e.Error.Code, e.ID, CodeInvalidRequest)
 	}
 }
 
@@ -158,11 +211,9 @@ func TestBadVersionResponseIsNotRouted(t *testing.T) {
 	req := c.serverRequest(MethodElicitationCreate)
 	c.send(map[string]any{"jsonrpc": "1.0", "id": json.RawMessage(req.ID),
 		"result": map[string]any{"action": "accept"}})
-	// The rejection does not carry the response's id: an error addressed to it
-	// could be taken for the answer to one of the peer's own requests.
-	if e := c.readErrorFrame(); e.Error.Code != CodeInvalidRequest || string(e.ID) != "null" {
-		t.Fatalf("rejection = code %d id %s, want %d with a null id", e.Error.Code, e.ID, CodeInvalidRequest)
-	}
+	// A response is not answered at all, so there is nothing to mistake for
+	// the answer to one of the peer's own requests, or to bounce back.
+	c.expectNoReply()
 	if got := toolResultText(t, c.awaitID(id)); got != "unanswered" {
 		t.Fatalf("tool saw %q, want the bad-version response ignored", got)
 	}
@@ -502,13 +553,12 @@ func TestHTTPRefusedInitializeDoesNotUnbalanceTheCounts(t *testing.T) {
 	}
 }
 
-// The rejection does not echo the peer's version string back: a notification
-// has no reply to amplify otherwise, and the string is the peer's to make as
-// long (and as expensive to quote) as the frame limit allows.
+// The rejection does not echo the peer's version string back: the string is the
+// peer's to make as long (and as expensive to quote) as the frame limit allows.
 func TestBadVersionRejectionDoesNotEchoThePeersString(t *testing.T) {
 	_, c := newTestServer(t, nil)
 	c.handshake()
-	c.send(map[string]any{"jsonrpc": strings.Repeat("\u0080", 100_000), "method": "notifications/x"})
+	c.send(map[string]any{"jsonrpc": strings.Repeat("\u0080", 100_000), "id": 7, "method": MethodPing})
 	e := c.readErrorFrame()
 	if e.Error.Code != CodeInvalidRequest {
 		t.Fatalf("code = %d", e.Error.Code)
@@ -633,5 +683,38 @@ func TestBroadcastGivesUpOnAPeerThatReadsTooSlowly(t *testing.T) {
 	}
 	if took > 1500*time.Millisecond {
 		t.Fatalf("Broadcast waited %v for a session capped at 500ms", took)
+	}
+}
+
+// The cap on one session's wait holds when the grace does not divide it: the
+// last window is cut short, not run to its full length past the cap.
+func TestBroadcastCapHoldsWhenGraceDoesNotDivideIt(t *testing.T) {
+	h := startServer(t, Options{}, UnixOptions{}, nil)
+	h.srv.broadcastGrace = 200 * time.Millisecond
+	h.srv.broadcastMaxWait = 250 * time.Millisecond
+	c := h.client()
+	sess := h.srv.Sessions()[0]
+	frame, err := encodeNotification("notifications/test", map[string]string{"pad": strings.Repeat("x", 32<<10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wedge(t, sess, frame)
+	for i := 0; i < 200; i++ {
+		go sess.sendRaw(frame)
+	}
+	time.Sleep(100 * time.Millisecond)
+	go func() { // a reader that always makes some progress
+		buf := make([]byte, 32<<10)
+		for {
+			time.Sleep(5 * time.Millisecond)
+			if _, err := c.conn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	start := time.Now()
+	h.srv.Broadcast("notifications/test", struct{}{})
+	if took := time.Since(start); took > 330*time.Millisecond {
+		t.Fatalf("Broadcast took %v with a 250ms cap and a 200ms grace; the last window ran past the cap", took)
 	}
 }

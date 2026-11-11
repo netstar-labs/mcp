@@ -124,6 +124,22 @@ func (m *wireMessage) validate() *RPCError {
 	return nil
 }
 
+// mayAnswer reports whether an error reply to this message is permitted. Only
+// a request has someone waiting on it; anything shaped like a response (an
+// error or result, with or without an id) must never be answered, because the
+// error a server sends for an unreadable request is itself such a message and
+// two servers answering each other's errors would never stop. A notification
+// has no recipient for a reply either.
+func (m *wireMessage) mayAnswer() bool {
+	switch m.kind() {
+	case kindRequest:
+		return true
+	case kindInvalid:
+		return m.Method == "" && m.Result == nil && m.Error == nil
+	}
+	return false
+}
+
 // checkVersion rejects a message whose "jsonrpc" member is not "2.0", whatever
 // its kind. It returns the id the error reply carries: the request's own, so
 // the caller can match it, and null for everything else, which has none. The
