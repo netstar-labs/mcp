@@ -43,13 +43,18 @@ existing callers may have relied on; the notes say which.
   the Session already did.
 - `jsonrpc` must be `"2.0"` on every message over stdio and sockets, as it already was for a single
   request and over HTTP: a notification or response with `"1.0"` or no version, and a batch
-  member with either, is answered with an invalid-request error (null id unless it was a request)
-  and not processed; the error does not quote the peer's version string. A peer that omits
+  member with either, is not processed; a request with a bad version is answered with an
+  invalid-request error carrying its own id, and no notification or response is answered (neither has
+  anyone waiting, and an error frame sent for one would itself be a message the peer
+  must not answer, so two servers could bounce them forever). The error does not quote the peer's
+  version string. A peer that omits
   `jsonrpc` on `notifications/initialized` never becomes Ready. Unchanged: a non-string `jsonrpc`
   is a parse error (null id), and member names match case-insensitively (`JSONRPC` is accepted).
   The Client still accepts any version from a server.
 - `Options.MaxQueuedBytes` (default 8 × `MaxMessageBytes`, 64 MiB at the default) bounds the bytes
-  held by a session's queued and running requests; past it a request gets the "overloaded" error.
+  held by a session's queued and running requests (frame length only; decoded copies, queued
+  replies and HTTP request bodies waiting for the read loop are not counted); past it a request
+  gets the "overloaded" error.
   A client pipelining many large requests now gets errors where it got silent queueing; one
   session could previously pin about 4 GiB.
 - `Server.Broadcast` and `NotifyResourceUpdated` no longer block on a peer that stopped reading:

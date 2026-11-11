@@ -105,8 +105,12 @@ type Options struct {
 	// Default DefaultMaxConcurrentRequests.
 	MaxConcurrentRequests int
 
-	// MaxQueuedBytes bounds, per session, the bytes held by requests that are
-	// queued or running (counted as the length of each request's frame). A request that would
+	// MaxQueuedBytes bounds, per session, the summed frame length of requests
+	// that are queued or running. It is an admission limit on frame bytes, not
+	// a bound on memory: a handler's decoded copy of its arguments, replies
+	// waiting in the outbound queue, the frame the read loop is handling and,
+	// over HTTP, request bodies waiting for the read loop are all outside it.
+	// A request that would
 	// exceed it is refused with the same "overloaded" error as one past the
 	// count limit, except that a request is always admitted when the session
 	// holds nothing else, so a small value never makes a large message

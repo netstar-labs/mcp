@@ -269,7 +269,9 @@ func (s *Session) handleFrame(ctx context.Context, frame []byte) {
 		return
 	}
 	if id, rerr := wm.checkVersion(); rerr != nil {
-		s.sendError(id, rerr)
+		if wm.mayAnswer() {
+			s.sendError(id, rerr)
+		}
 		return
 	}
 	s.route(ctx, &wm, len(trimmed))
@@ -318,7 +320,9 @@ func (s *Session) handleBatch(ctx context.Context, frame []byte) {
 			continue
 		}
 		if id, rerr := wm.checkVersion(); rerr != nil {
-			replies = append(replies, marshalError(id, rerr))
+			if wm.mayAnswer() {
+				replies = append(replies, marshalError(id, rerr))
+			}
 			continue
 		}
 		switch wm.kind() {
@@ -329,7 +333,9 @@ func (s *Session) handleBatch(ctx context.Context, frame []byte) {
 		case kindResponse:
 			s.routeResponse(&wm)
 		default:
-			replies = append(replies, marshalError(nullLiteral, Errorf(CodeInvalidRequest, "invalid request")))
+			if wm.mayAnswer() {
+				replies = append(replies, marshalError(nullLiteral, Errorf(CodeInvalidRequest, "invalid request")))
+			}
 		}
 	}
 	if len(replies) > 0 {
@@ -360,7 +366,9 @@ func (s *Session) route(ctx context.Context, wm *wireMessage, frameBytes int) {
 	case kindResponse:
 		s.routeResponse(wm)
 	default:
-		s.sendError(nullLiteral, Errorf(CodeInvalidRequest, "invalid request"))
+		if wm.mayAnswer() {
+			s.sendError(nullLiteral, Errorf(CodeInvalidRequest, "invalid request"))
+		}
 	}
 }
 
@@ -625,7 +633,7 @@ func (s *Session) offerWithin(frame []byte, grace, limit time.Duration) error {
 			return errSessionClosed
 		case <-t.C:
 			if s.written.Load() != seen && time.Now().Before(deadline) {
-				t.Reset(grace)
+				t.Reset(min(grace, time.Until(deadline)))
 				continue
 			}
 			_ = s.Close()
