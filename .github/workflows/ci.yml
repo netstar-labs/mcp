@@ -53,11 +53,20 @@ jobs:
         with:
           go-version-file: go.mod
       # Pinned, not @latest: a check that can start failing with no change in the repo is
-      # not a gate. The same pins are in hack/gate.sh; bump them together.
+      # not a gate. The same pins are in hack/gate.sh; bump them together. The tools may need a
+      # newer Go than go.mod asks for (staticcheck v0.8.2 wants 1.26), and setup-go pins
+      # GOTOOLCHAIN=local, so they run with auto, as in hack/gate.sh; the repo's own build and
+      # tidy stay on the toolchain go.mod names.
       - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+        env:
+          GOTOOLCHAIN: auto
       # deadcode exits 0 even when it finds something; only an empty report passes.
       - run: test -z "$(go run golang.org/x/tools/cmd/deadcode@v0.52.0 -test ./...)"
+        env:
+          GOTOOLCHAIN: auto
       - run: go mod tidy && git diff --exit-code -- go.mod go.sum
       - name: no module dependencies, ever
         run: "! grep -q '^require' go.mod"
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+        env:
+          GOTOOLCHAIN: auto
