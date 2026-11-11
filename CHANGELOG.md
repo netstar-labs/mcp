@@ -54,9 +54,9 @@ existing callers may have relied on; the notes say which.
   session could previously pin about 4 GiB.
 - `Server.Broadcast` and `NotifyResourceUpdated` no longer block on a peer that stopped reading:
   a session whose outbound queue is full is waited on while its writer makes progress and closed
-  once it makes none for 5 s; the other sessions are served first. A peer that reads slowly is
-  not closed, and `Broadcast` then waits as long as it takes to drain what is queued ahead of the
-  notification. `Session.Notify` still blocks.
+  once it makes none for 5 s, or when the wait has lasted 30 s in all; the other sessions are
+  served first. A peer that reads at a useful rate is not closed, and `Broadcast` then waits for
+  what is queued ahead of the notification, up to the 30 s. `Session.Notify` still blocks.
 - `mcpd -socket` on macOS and the BSDs serves connections with the default flags. `MaxConnsPerUID`
   alone no longer makes admission demand peer credentials; a connection whose credentials cannot be
   read is admitted and not counted per uid, and `Serve` logs that once. Linux behaviour is

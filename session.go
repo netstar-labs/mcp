@@ -606,11 +606,14 @@ func (s *Session) offer(frame []byte) error {
 	}
 }
 
-// offerWithin waits for room in the queue and closes the session if the writer
-// makes no progress for grace: a peer that has stopped reading. A peer that is
-// reading, however slowly, is waited on, since the frame may be queued behind
-// every reply a busy session has in flight.
-func (s *Session) offerWithin(frame []byte, grace time.Duration) error {
+// offerWithin waits for room in the queue. It closes the session if the writer
+// makes no progress for grace (a peer that has stopped reading), or if the wait
+// has lasted limit in all: a peer that reads, but slowly enough to hold the
+// caller for as long as the replies queued ahead of the frame take, is as good as
+// gone. A peer that reads at a useful rate is waited on, since the frame may be
+// queued behind every reply a busy session has in flight.
+func (s *Session) offerWithin(frame []byte, grace, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
 	t := time.NewTimer(grace)
 	defer t.Stop()
 	for {
@@ -621,12 +624,12 @@ func (s *Session) offerWithin(frame []byte, grace time.Duration) error {
 		case <-s.done:
 			return errSessionClosed
 		case <-t.C:
-			if s.written.Load() != seen {
+			if s.written.Load() != seen && time.Now().Before(deadline) {
 				t.Reset(grace)
 				continue
 			}
 			_ = s.Close()
-			return fmt.Errorf("closed: not reading for %v", grace)
+			return fmt.Errorf("closed: outbound queue did not drain (grace %v, limit %v)", grace, limit)
 		}
 	}
 }

@@ -30,6 +30,11 @@ const (
 	// outbound queue is full go without its writer making progress before
 	// closing it.
 	defaultBroadcastGrace = 5 * time.Second
+	// defaultBroadcastMaxWait is the most a fan-out waits on one session even
+	// if its writer keeps making progress: a peer that drains a frame every few
+	// seconds is as good as stalled, and would otherwise hold the caller for as
+	// long as the replies queued ahead of the notification take.
+	defaultBroadcastMaxWait = 30 * time.Second
 )
 
 func sprintf(format string, args ...any) string {
@@ -207,6 +212,9 @@ type Server struct {
 	// is full go without its writer making progress before closing it. A field
 	// so tests can shorten it.
 	broadcastGrace time.Duration
+	// broadcastMaxWait caps how long a fan-out waits on one session that is
+	// making progress, however slowly. A field so tests can shorten it.
+	broadcastMaxWait time.Duration
 
 	sessMu   sync.Mutex
 	sessions map[*Session]struct{}
@@ -240,12 +248,13 @@ func New(opts Options) *Server {
 		opts.DrainTimeout = DefaultDrainTimeout
 	}
 	return &Server{
-		opts:           opts,
-		broadcastGrace: defaultBroadcastGrace,
-		tools:          make(map[string]*toolEntry),
-		resources:      make(map[string]*resourceEntry),
-		prompts:        make(map[string]*promptEntry),
-		sessions:       make(map[*Session]struct{}),
+		opts:             opts,
+		broadcastGrace:   defaultBroadcastGrace,
+		broadcastMaxWait: defaultBroadcastMaxWait,
+		tools:            make(map[string]*toolEntry),
+		resources:        make(map[string]*resourceEntry),
+		prompts:          make(map[string]*promptEntry),
+		sessions:         make(map[*Session]struct{}),
 	}
 }
 
@@ -407,17 +416,18 @@ func (s *Server) negotiate(requested string) string {
 
 // Broadcast sends a notification to every session that has completed
 // initialization. Errors are logged, not returned. A session whose outbound
-// queue is full is waited on, together with any others in that state, while
-// its writer keeps making progress, and is closed once the writer makes none for
-// a grace period (5s): a peer that has stopped reading loses its connection
-// rather than back-pressuring everyone, and a client that reconnects refreshes
-// what the notification would have told it. A peer that is reading slowly is
-// not closed, but Broadcast then waits as long as the peer takes to drain what
-// is queued ahead of the frame (replies share the queue); only a peer that makes
-// no progress is bounded by the grace period, even with UnixOptions.WriteTimeout
-// unset. A single write of one very large frame that outlasts the grace counts as
-// no progress. Session.Notify, by contrast, still blocks on a full queue,
-// because ordering with replies matters to its callers.
+// queue is full is waited on, together with any others in that state, and is
+// closed if its writer makes no progress for a grace period (5s; a peer that
+// stalls after one more write is closed within twice that) or if the wait has
+// lasted 30s in all. A peer that has stopped reading therefore loses its
+// connection rather than back-pressuring everyone, and so does one that reads too
+// slowly to matter, which would otherwise hold the caller for as long as the
+// replies queued ahead of the frame take to drain; a client that reconnects
+// refreshes what the notification would have told it. A peer that reads at a
+// useful rate is waited on and not closed, which can take up to the 30s, even with
+// UnixOptions.WriteTimeout unset. A single write of one very large frame that
+// outlasts the grace counts as no progress. Session.Notify, by contrast, still
+// blocks on a full queue, because ordering with replies matters to its callers.
 func (s *Server) Broadcast(method string, params any) {
 	var ready []*Session
 	for _, sess := range s.Sessions() {
@@ -457,7 +467,7 @@ func (s *Server) fanout(sessions []*Session, method string, params any, logErr f
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := sess.offerWithin(frame, s.broadcastGrace); err != nil {
+			if err := sess.offerWithin(frame, s.broadcastGrace, s.broadcastMaxWait); err != nil {
 				logErr(sess, err)
 			}
 		}()

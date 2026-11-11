@@ -594,3 +594,44 @@ func TestPerUIDCapNotEnforcedIsLoggedOnce(t *testing.T) {
 		t.Fatalf("logged %d times, want once; log:\n%s", n, lb.String())
 	}
 }
+
+// A peer that makes progress too slowly to matter is closed all the same: the
+// wait on one session has an overall bound, or a peer that drains a frame every
+// few seconds could hold a Broadcast caller for as long as it likes.
+func TestBroadcastGivesUpOnAPeerThatReadsTooSlowly(t *testing.T) {
+	h := startServer(t, Options{}, UnixOptions{}, nil)
+	h.srv.broadcastGrace = 100 * time.Millisecond
+	h.srv.broadcastMaxWait = 500 * time.Millisecond
+	c := h.client()
+	sess := h.srv.Sessions()[0]
+
+	frame, err := encodeNotification("notifications/test", map[string]string{"pad": strings.Repeat("x", 32<<10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wedge(t, sess, frame)
+	for i := 0; i < 64; i++ {
+		go sess.sendRaw(frame)
+	}
+	time.Sleep(100 * time.Millisecond)
+	go func() { // reading, so the writer progresses, but needs over a second to get through
+		buf := make([]byte, 32<<10)
+		for {
+			time.Sleep(10 * time.Millisecond)
+			_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := c.conn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	start := time.Now()
+	h.srv.Broadcast("notifications/test", struct{}{})
+	took := time.Since(start)
+	if st := sess.State(); st != StateClosed {
+		t.Fatalf("a peer too slow to matter was kept (state %d) for %v", st, took)
+	}
+	if took > 1500*time.Millisecond {
+		t.Fatalf("Broadcast waited %v for a session capped at 500ms", took)
+	}
+}
